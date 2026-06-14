@@ -2,7 +2,7 @@
 Contributors: maomomo
 Requires at least: 5.8
 Requires PHP: 7.4
-Stable tag: 1.0.0
+Stable tag: 1.2.0
 
 在 WordPress 媒体库中使用多个 TinyPNG API Token 轮换压缩图片，并支持转换 WebP。
 
@@ -12,7 +12,9 @@ Stable tag: 1.0.0
 * 支持一行一个 Token，或 `名称|TOKEN|月额度`。
 * 媒体库列表支持单张图片：TinyPNG 压缩、转 WebP、压缩+WebP。
 * 媒体库批量操作支持：压缩、转 WebP、压缩并转 WebP。
+* 支持 WP-CLI 批量执行压缩/转换，适合大批量后台处理。
 * 默认压缩原图和 WordPress 已生成的缩略图尺寸。
+* 可选上传后自动处理：不自动处理、自动压缩、自动转 WebP、自动压缩并转 WebP。
 * 转 WebP 会创建新的 WebP 附件，并和原附件互相关联。
 * 支持 TinyPNG API 专用代理设置。
 * 压缩收益不足时自动保留原图：小于 1MB 的图片压缩后大于原图 80% 不覆盖；大于等于 1MB 的图片压缩后大于原图 90% 不覆盖。
@@ -23,7 +25,33 @@ Stable tag: 1.0.0
 2. 进入「设置 → TinyPNG 媒体压缩」。
 3. 填写一个或多个 TinyPNG API Token。
 4. 如需代理，在代理地址中填写 HTTP/HTTPS/SOCKS5 代理。
-5. 到「媒体 → 媒体库」使用行操作或批量操作。
+5. 如需新上传图片自动处理，在「上传后自动处理」中选择模式。
+6. 到「媒体 → 媒体库」使用行操作或批量操作。
+
+== WP-CLI 用法 ==
+
+处理全部支持的图片附件：
+
+`wp maomomo-tinypng --mode=compress`
+
+压缩并转换最近上传的一批图片：
+
+`wp maomomo-tinypng --mode=both --after=2026-06-01 --limit=50`
+
+只处理指定附件 ID：
+
+`wp maomomo-tinypng 123 456,789 --mode=webp`
+
+先预览将处理哪些附件，不调用 TinyPNG、不写文件：
+
+`wp maomomo-tinypng --mode=both --dry-run`
+
+参数说明：
+
+* `--mode=compress|webp|both`：压缩、转 WebP、压缩并转 WebP。默认 `compress`。
+* `--limit=50`：限制最多处理数量。
+* `--after=YYYY-MM-DD` / `--before=YYYY-MM-DD`：按上传日期过滤。
+* `--dry-run`：仅预览。
 
 == Token 格式 ==
 

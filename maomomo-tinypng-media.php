@@ -3,7 +3,7 @@
  * Plugin Name: MaoMoMo TinyPNG Media
  * Plugin URI: https://www.maomomo.com
  * Description: 在媒体库中使用多个 TinyPNG API Token 轮换压缩图片，并支持转换 WebP。
- * Version: 1.0.0
+ * Version: 1.2.0
  * Author: MAOMOMO
  * Author URI: https://www.maomomo.com
  * Requires at least: 5.8
@@ -24,6 +24,8 @@ final class MaoMoMo_TinyPNG_Media {
 
     private static $instance = null;
 
+    private $auto_processing = false;
+
     public static function instance() {
         if ( null === self::$instance ) {
             self::$instance = new self();
@@ -41,6 +43,7 @@ final class MaoMoMo_TinyPNG_Media {
         add_action( 'admin_notices', array( $this, 'render_admin_notice' ) );
         add_action( 'http_api_curl', array( $this, 'apply_tinypng_proxy' ), 10, 3 );
 
+        add_filter( 'wp_generate_attachment_metadata', array( $this, 'auto_process_uploaded_attachment' ), 20, 2 );
         add_filter( 'media_row_actions', array( $this, 'add_media_row_actions' ), 10, 3 );
         add_filter( 'bulk_actions-upload', array( $this, 'register_bulk_actions' ) );
         add_filter( 'handle_bulk_actions-upload', array( $this, 'handle_bulk_actions' ), 10, 3 );
@@ -48,6 +51,10 @@ final class MaoMoMo_TinyPNG_Media {
         add_action( 'manage_media_custom_column', array( $this, 'render_media_column' ), 10, 2 );
         add_action( 'attachment_submitbox_misc_actions', array( $this, 'render_attachment_buttons' ) );
         add_filter( 'upload_mimes', array( $this, 'allow_webp_upload' ) );
+
+        if ( defined( 'WP_CLI' ) && WP_CLI ) {
+            WP_CLI::add_command( 'maomomo-tinypng', array( $this, 'cli_command' ) );
+        }
     }
 
     public function register_settings_page() {
@@ -113,6 +120,18 @@ final class MaoMoMo_TinyPNG_Media {
                                 <input type="checkbox" name="include_sizes" value="1" <?php checked( ! empty( $settings['include_sizes'] ) ); ?>>
                                 压缩原图和 WordPress 已生成的缩略图尺寸
                             </label>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row"><label for="maomomo-tinypng-auto-mode">上传后自动处理</label></th>
+                        <td>
+                            <select id="maomomo-tinypng-auto-mode" name="auto_mode">
+                                <option value="none" <?php selected( $settings['auto_mode'], 'none' ); ?>>不自动处理</option>
+                                <option value="compress" <?php selected( $settings['auto_mode'], 'compress' ); ?>>自动 TinyPNG 压缩</option>
+                                <option value="webp" <?php selected( $settings['auto_mode'], 'webp' ); ?>>自动转 WebP</option>
+                                <option value="both" <?php selected( $settings['auto_mode'], 'both' ); ?>>自动压缩并转 WebP</option>
+                            </select>
+                            <p class="description">启用后，新上传到媒体库的图片会在 WordPress 生成附件元数据后自动处理。</p>
                         </td>
                     </tr>
                     <tr>
@@ -204,11 +223,17 @@ final class MaoMoMo_TinyPNG_Media {
         $default_limit = isset( $_POST['default_limit'] ) ? absint( $_POST['default_limit'] ) : self::DEFAULT_LIMIT;
         $timeout       = isset( $_POST['timeout'] ) ? absint( $_POST['timeout'] ) : 90;
         $proxy         = isset( $_POST['proxy'] ) ? sanitize_text_field( wp_unslash( $_POST['proxy'] ) ) : '';
+        $auto_mode     = isset( $_POST['auto_mode'] ) ? sanitize_key( wp_unslash( $_POST['auto_mode'] ) ) : 'none';
+
+        if ( ! in_array( $auto_mode, array( 'none', 'compress', 'webp', 'both' ), true ) ) {
+            $auto_mode = 'none';
+        }
 
         $settings = array(
             'tokens_text'   => $this->normalize_tokens_text( $tokens_text ),
             'default_limit' => max( 1, $default_limit ),
             'include_sizes' => ! empty( $_POST['include_sizes'] ),
+            'auto_mode'     => $auto_mode,
             'timeout'       => min( 300, max( 10, $timeout ) ),
             'proxy'         => trim( $proxy ),
         );
@@ -413,6 +438,40 @@ final class MaoMoMo_TinyPNG_Media {
         }
     }
 
+    public function auto_process_uploaded_attachment( $metadata, $attachment_id ) {
+        if ( $this->auto_processing ) {
+            return $metadata;
+        }
+
+        $settings  = $this->get_settings();
+        $auto_mode = isset( $settings['auto_mode'] ) ? $settings['auto_mode'] : 'none';
+
+        if ( ! in_array( $auto_mode, array( 'compress', 'webp', 'both' ), true ) ) {
+            return $metadata;
+        }
+
+        if ( ! $this->is_supported_attachment( $attachment_id ) ) {
+            return $metadata;
+        }
+
+        $this->auto_processing = true;
+
+        if ( is_array( $metadata ) && ! empty( $metadata ) ) {
+            update_post_meta( $attachment_id, '_wp_attachment_metadata', $metadata );
+        }
+
+        $result                = $this->process_attachment( $attachment_id, $auto_mode );
+        $this->auto_processing = false;
+
+        if ( is_array( $result ) ) {
+            $type = empty( $result['failed'] ) ? 'success' : 'warning';
+            $this->store_notice( $type, '上传后自动处理：' . $this->format_summary_message( $result ) );
+        }
+
+        $updated_metadata = wp_get_attachment_metadata( $attachment_id );
+        return is_array( $updated_metadata ) ? $updated_metadata : $metadata;
+    }
+
     public function handle_single_action() {
         $attachment_id = isset( $_GET['attachment_id'] ) ? absint( $_GET['attachment_id'] ) : 0;
         $mode          = isset( $_GET['mode'] ) ? sanitize_key( wp_unslash( $_GET['mode'] ) ) : 'compress';
@@ -456,6 +515,155 @@ final class MaoMoMo_TinyPNG_Media {
         }
 
         echo '<div class="notice notice-' . esc_attr( $type ) . ' is-dismissible"><p>' . wp_kses_post( $message ) . '</p></div>';
+    }
+
+    /**
+     * 批量压缩或转换媒体库图片。
+     *
+     * ## OPTIONS
+     *
+     * [<attachment-id>...]
+     * : 可选附件 ID，支持空格或逗号分隔。不传时处理全部支持的图片附件。
+     *
+     * [--mode=<mode>]
+     * : 处理模式：compress、webp、both。默认 compress。
+     * ---
+     * default: compress
+     * options:
+     *   - compress
+     *   - webp
+     *   - both
+     * ---
+     *
+     * [--limit=<number>]
+     * : 最多处理多少个附件。
+     *
+     * [--after=<date>]
+     * : 只处理此日期之后上传的附件，例如 2026-06-01。
+     *
+     * [--before=<date>]
+     * : 只处理此日期之前上传的附件，例如 2026-06-30。
+     *
+     * [--dry-run]
+     * : 只列出将处理的附件，不调用 TinyPNG，不写入文件。
+     *
+     * ## EXAMPLES
+     *
+     *     wp maomomo-tinypng --mode=compress --limit=50
+     *     wp maomomo-tinypng --mode=both --after=2026-06-01
+     *     wp maomomo-tinypng 123 456,789 --mode=webp
+     */
+    public function cli_command( $args, $assoc_args ) {
+        if ( ! defined( 'WP_CLI' ) || ! WP_CLI ) {
+            return;
+        }
+
+        $mode = isset( $assoc_args['mode'] ) ? sanitize_key( (string) $assoc_args['mode'] ) : 'compress';
+        if ( ! in_array( $mode, array( 'compress', 'webp', 'both' ), true ) ) {
+            WP_CLI::error( 'mode 只支持 compress、webp、both。' );
+        }
+
+        $ids = $this->cli_get_attachment_ids( $args, $assoc_args );
+        if ( empty( $ids ) ) {
+            WP_CLI::warning( '没有找到需要处理的附件。' );
+            return;
+        }
+
+        $dry_run = ! empty( $assoc_args['dry-run'] );
+        $limit   = isset( $assoc_args['limit'] ) ? absint( $assoc_args['limit'] ) : 0;
+        if ( $limit > 0 ) {
+            $ids = array_slice( $ids, 0, $limit );
+        }
+
+        $total   = count( $ids );
+        $summary = $this->empty_summary();
+
+        WP_CLI::log( sprintf( '准备处理 %d 个附件，模式：%s%s', $total, $mode, $dry_run ? '，dry-run' : '' ) );
+
+        $progress = \WP_CLI\Utils\make_progress_bar( 'TinyPNG processing', $total );
+
+        foreach ( $ids as $attachment_id ) {
+            $attachment_id = absint( $attachment_id );
+
+            if ( $dry_run ) {
+                $summary['skipped']++;
+                WP_CLI::log( sprintf( '#%d %s', $attachment_id, get_attached_file( $attachment_id ) ) );
+                $progress->tick();
+                continue;
+            }
+
+            $result = $this->process_attachment( $attachment_id, $mode );
+            $this->merge_summary( $summary, $result );
+
+            if ( ! empty( $result['messages'] ) ) {
+                foreach ( array_unique( $result['messages'] ) as $message ) {
+                    WP_CLI::warning( sprintf( '#%d %s', $attachment_id, wp_strip_all_tags( $message ) ) );
+                }
+            }
+
+            $progress->tick();
+        }
+
+        $progress->finish();
+
+        $saved = max( 0, (int) $summary['bytes_before'] - (int) $summary['bytes_after'] );
+        WP_CLI::success(
+            sprintf(
+                'TinyPNG 处理完成：成功 %d，失败 %d，跳过 %d，WebP %d，节省 %s。',
+                (int) $summary['ok'],
+                (int) $summary['failed'],
+                (int) $summary['skipped'],
+                (int) $summary['webp'],
+                size_format( $saved, 1 )
+            )
+        );
+    }
+
+    private function cli_get_attachment_ids( $args, $assoc_args ) {
+        if ( ! empty( $args ) ) {
+            $ids = array();
+            foreach ( $args as $arg ) {
+                foreach ( explode( ',', (string) $arg ) as $id ) {
+                    $id = absint( $id );
+                    if ( $id ) {
+                        $ids[] = $id;
+                    }
+                }
+            }
+
+            return array_values( array_unique( $ids ) );
+        }
+
+        $query_args = array(
+            'post_type'      => 'attachment',
+            'post_status'    => 'inherit',
+            'post_mime_type' => 'image',
+            'posts_per_page' => -1,
+            'fields'         => 'ids',
+            'orderby'        => 'ID',
+            'order'          => 'ASC',
+        );
+
+        if ( ! empty( $assoc_args['after'] ) || ! empty( $assoc_args['before'] ) ) {
+            $query_args['date_query'] = array();
+            if ( ! empty( $assoc_args['after'] ) ) {
+                $query_args['date_query'][] = array( 'after' => (string) $assoc_args['after'], 'inclusive' => true );
+            }
+            if ( ! empty( $assoc_args['before'] ) ) {
+                $query_args['date_query'][] = array( 'before' => (string) $assoc_args['before'], 'inclusive' => true );
+            }
+        }
+
+        $query = new WP_Query( $query_args );
+        $ids   = array();
+
+        foreach ( $query->posts as $attachment_id ) {
+            if ( $this->is_supported_attachment( $attachment_id ) ) {
+                $ids[] = (int) $attachment_id;
+            }
+        }
+
+        return $ids;
     }
 
     private function media_action_link( $attachment_id, $mode, $label ) {
@@ -1079,6 +1287,7 @@ final class MaoMoMo_TinyPNG_Media {
             'tokens_text'   => '',
             'default_limit' => self::DEFAULT_LIMIT,
             'include_sizes' => true,
+            'auto_mode'     => 'none',
             'timeout'       => 90,
             'proxy'         => '',
         );
