@@ -36,8 +36,10 @@ final class MaoMoMo_TinyPNG_Media {
         add_action( 'admin_menu', array( $this, 'register_settings_page' ) );
         add_action( 'admin_post_maomomo_tinypng_save_settings', array( $this, 'save_settings' ) );
         add_action( 'admin_post_maomomo_tinypng_reset_usage', array( $this, 'reset_usage' ) );
+        add_action( 'admin_post_maomomo_tinypng_fix_webp_paths', array( $this, 'fix_webp_paths_action' ) );
         add_action( 'admin_post_maomomo_tinypng_media', array( $this, 'handle_single_action' ) );
         add_action( 'admin_notices', array( $this, 'render_admin_notice' ) );
+        add_action( 'http_api_curl', array( $this, 'apply_tinypng_proxy' ), 10, 3 );
 
         add_filter( 'media_row_actions', array( $this, 'add_media_row_actions' ), 10, 3 );
         add_filter( 'bulk_actions-upload', array( $this, 'register_bulk_actions' ) );
@@ -126,6 +128,22 @@ final class MaoMoMo_TinyPNG_Media {
                             > 秒
                         </td>
                     </tr>
+                    <tr>
+                        <th scope="row"><label for="maomomo-tinypng-proxy">代理地址</label></th>
+                        <td>
+                            <input
+                                id="maomomo-tinypng-proxy"
+                                type="text"
+                                class="regular-text"
+                                name="proxy"
+                                value="<?php echo esc_attr( (string) $settings['proxy'] ); ?>"
+                                placeholder="http://127.0.0.1:7890"
+                            >
+                            <p class="description">
+                                仅 TinyPNG API 请求使用此代理。支持 <code>http://</code>、<code>https://</code>、<code>socks5://</code>、<code>socks5h://</code>，也支持在 URL 中带账号密码。
+                            </p>
+                        </td>
+                    </tr>
                 </table>
 
                 <?php submit_button( '保存设置' ); ?>
@@ -164,6 +182,13 @@ final class MaoMoMo_TinyPNG_Media {
                 <input type="hidden" name="action" value="maomomo_tinypng_reset_usage">
                 <?php submit_button( '重置本地用量记录', 'secondary', 'submit', false ); ?>
             </form>
+
+            <form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" style="margin-top: 12px;">
+                <?php wp_nonce_field( 'maomomo_tinypng_fix_webp_paths' ); ?>
+                <input type="hidden" name="action" value="maomomo_tinypng_fix_webp_paths">
+                <?php submit_button( '修复已生成 WebP 附件路径', 'secondary', 'submit', false ); ?>
+                <p class="description">如果在 Windows 环境中出现 <code>2026/05filename.webp</code> 这类少一个斜杠的 URL，可点击此按钮修复。</p>
+            </form>
         </div>
         <?php
     }
@@ -178,12 +203,14 @@ final class MaoMoMo_TinyPNG_Media {
         $tokens_text   = isset( $_POST['tokens_text'] ) ? wp_unslash( $_POST['tokens_text'] ) : '';
         $default_limit = isset( $_POST['default_limit'] ) ? absint( $_POST['default_limit'] ) : self::DEFAULT_LIMIT;
         $timeout       = isset( $_POST['timeout'] ) ? absint( $_POST['timeout'] ) : 90;
+        $proxy         = isset( $_POST['proxy'] ) ? sanitize_text_field( wp_unslash( $_POST['proxy'] ) ) : '';
 
         $settings = array(
             'tokens_text'   => $this->normalize_tokens_text( $tokens_text ),
             'default_limit' => max( 1, $default_limit ),
             'include_sizes' => ! empty( $_POST['include_sizes'] ),
             'timeout'       => min( 300, max( 10, $timeout ) ),
+            'proxy'         => trim( $proxy ),
         );
 
         update_option( self::OPTION_SETTINGS, $settings, false );
@@ -210,6 +237,20 @@ final class MaoMoMo_TinyPNG_Media {
         );
 
         $this->store_notice( 'success', '本地用量记录已重置。' );
+
+        wp_safe_redirect( admin_url( 'options-general.php?page=maomomo-tinypng-media' ) );
+        exit;
+    }
+
+    public function fix_webp_paths_action() {
+        if ( ! current_user_can( 'manage_options' ) ) {
+            wp_die( '权限不足。' );
+        }
+
+        check_admin_referer( 'maomomo_tinypng_fix_webp_paths' );
+
+        $fixed = $this->fix_generated_webp_paths();
+        $this->store_notice( 'success', '已修复 WebP 附件路径：' . $fixed . ' 个。' );
 
         wp_safe_redirect( admin_url( 'options-general.php?page=maomomo-tinypng-media' ) );
         exit;
@@ -333,6 +374,43 @@ final class MaoMoMo_TinyPNG_Media {
     public function allow_webp_upload( $mimes ) {
         $mimes['webp'] = 'image/webp';
         return $mimes;
+    }
+
+    public function apply_tinypng_proxy( $handle, $parsed_args, $url ) {
+        if ( empty( $parsed_args['maomomo_tinypng_proxy'] ) ) {
+            return;
+        }
+
+        $proxy = trim( (string) $parsed_args['maomomo_tinypng_proxy'] );
+        if ( '' === $proxy ) {
+            return;
+        }
+
+        $parts = wp_parse_url( $proxy );
+        if ( empty( $parts['host'] ) ) {
+            return;
+        }
+
+        $scheme = isset( $parts['scheme'] ) ? strtolower( $parts['scheme'] ) : 'http';
+        $port   = isset( $parts['port'] ) ? (int) $parts['port'] : 0;
+        $host   = $parts['host'] . ( $port ? ':' . $port : '' );
+
+        curl_setopt( $handle, CURLOPT_PROXY, $host );
+
+        if ( ! empty( $parts['user'] ) ) {
+            $password = isset( $parts['pass'] ) ? rawurldecode( $parts['pass'] ) : '';
+            curl_setopt( $handle, CURLOPT_PROXYUSERPWD, rawurldecode( $parts['user'] ) . ':' . $password );
+        }
+
+        if ( 'socks5h' === $scheme && defined( 'CURLPROXY_SOCKS5_HOSTNAME' ) ) {
+            curl_setopt( $handle, CURLOPT_PROXYTYPE, CURLPROXY_SOCKS5_HOSTNAME );
+        } elseif ( 'socks5' === $scheme && defined( 'CURLPROXY_SOCKS5' ) ) {
+            curl_setopt( $handle, CURLOPT_PROXYTYPE, CURLPROXY_SOCKS5 );
+        } elseif ( 'https' === $scheme && defined( 'CURLPROXY_HTTPS' ) ) {
+            curl_setopt( $handle, CURLOPT_PROXYTYPE, CURLPROXY_HTTPS );
+        } elseif ( defined( 'CURLPROXY_HTTP' ) ) {
+            curl_setopt( $handle, CURLOPT_PROXYTYPE, CURLPROXY_HTTP );
+        }
     }
 
     public function handle_single_action() {
@@ -463,6 +541,14 @@ final class MaoMoMo_TinyPNG_Media {
             if ( '' === $body ) {
                 $summary['failed']++;
                 $summary['messages'][] = 'TinyPNG 返回空文件：' . wp_basename( $path );
+                continue;
+            }
+
+            if ( ! $this->should_replace_compressed_file( (int) $before, strlen( $body ) ) ) {
+                $summary['skipped']++;
+                $summary['bytes_before'] += (int) $before;
+                $summary['bytes_after']  += (int) $before;
+                $summary['messages'][] = wp_basename( $path ) . ' 压缩收益不足，保留原图。';
                 continue;
             }
 
@@ -622,6 +708,10 @@ final class MaoMoMo_TinyPNG_Media {
             'headers'     => $headers,
         );
 
+        if ( ! empty( $settings['proxy'] ) ) {
+            $request_args['maomomo_tinypng_proxy'] = $settings['proxy'];
+        }
+
         if ( array_key_exists( 'body', $args ) ) {
             $request_args['body'] = $args['body'];
         }
@@ -778,8 +868,14 @@ final class MaoMoMo_TinyPNG_Media {
         $existing_id = (int) get_post_meta( $attachment_id, '_maomomo_tinypng_webp_id', true );
         if ( $existing_id && 'attachment' === get_post_type( $existing_id ) ) {
             $existing_file = get_attached_file( $existing_id );
-            if ( $existing_file ) {
+            if ( $existing_file && file_exists( $existing_file ) ) {
                 return $existing_file;
+            }
+
+            $repaired_file = $this->guess_existing_webp_file( $existing_id, $source );
+            if ( $repaired_file ) {
+                update_post_meta( $existing_id, '_wp_attached_file', $this->attachment_relative_path( $repaired_file ) );
+                return $repaired_file;
             }
         }
 
@@ -803,7 +899,6 @@ final class MaoMoMo_TinyPNG_Media {
 
         if ( $existing_id && 'attachment' === get_post_type( $existing_id ) ) {
             $webp_id = $existing_id;
-            update_attached_file( $webp_id, $webp_path );
             wp_update_post(
                 array(
                     'ID'             => $webp_id,
@@ -811,6 +906,7 @@ final class MaoMoMo_TinyPNG_Media {
                     'post_title'     => $title,
                 )
             );
+            update_post_meta( $webp_id, '_wp_attached_file', $this->attachment_relative_path( $webp_path ) );
         } else {
             $webp_id = wp_insert_attachment(
                 array(
@@ -827,6 +923,8 @@ final class MaoMoMo_TinyPNG_Media {
             if ( is_wp_error( $webp_id ) ) {
                 return $webp_id;
             }
+
+            update_post_meta( $webp_id, '_wp_attached_file', $this->attachment_relative_path( $webp_path ) );
         }
 
         $metadata = wp_generate_attachment_metadata( $webp_id, $webp_path );
@@ -847,17 +945,102 @@ final class MaoMoMo_TinyPNG_Media {
     }
 
     private function build_basic_image_metadata( $path ) {
-        $upload_dir = wp_upload_dir();
-        $relative   = ltrim( str_replace( wp_normalize_path( trailingslashit( $upload_dir['basedir'] ) ), '', wp_normalize_path( $path ) ), '/' );
-        $size       = wp_getimagesize( $path );
+        $size = wp_getimagesize( $path );
 
         return array(
             'width'    => is_array( $size ) ? (int) $size[0] : 0,
             'height'   => is_array( $size ) ? (int) $size[1] : 0,
-            'file'     => $relative,
+            'file'     => $this->attachment_relative_path( $path ),
             'filesize' => file_exists( $path ) ? filesize( $path ) : 0,
             'sizes'    => array(),
         );
+    }
+
+    private function attachment_relative_path( $path ) {
+        $upload_dir = wp_upload_dir();
+        $base_dir   = wp_normalize_path( trailingslashit( $upload_dir['basedir'] ) );
+        $path       = wp_normalize_path( $path );
+
+        if ( 0 === strpos( $path, $base_dir ) ) {
+            return ltrim( substr( $path, strlen( $base_dir ) ), '/' );
+        }
+
+        return wp_basename( $path );
+    }
+
+    private function fix_generated_webp_paths() {
+        $query = new WP_Query(
+            array(
+                'post_type'      => 'attachment',
+                'post_status'    => 'inherit',
+                'post_mime_type' => 'image/webp',
+                'posts_per_page' => -1,
+                'fields'         => 'ids',
+                'meta_query'     => array(
+                    array(
+                        'key'     => '_maomomo_tinypng_source_id',
+                        'compare' => 'EXISTS',
+                    ),
+                ),
+            )
+        );
+
+        $fixed = 0;
+
+        foreach ( $query->posts as $webp_id ) {
+            $file = get_attached_file( $webp_id, true );
+            if ( ! $file || ! file_exists( $file ) ) {
+                $source_id = (int) get_post_meta( $webp_id, '_maomomo_tinypng_source_id', true );
+                $source    = $source_id ? get_attached_file( $source_id, true ) : '';
+
+                if ( $source ) {
+                    $file = $this->guess_existing_webp_file( $webp_id, $source );
+                }
+            }
+
+            if ( ! $file || ! file_exists( $file ) ) {
+                continue;
+            }
+
+            $relative = $this->attachment_relative_path( $file );
+            if ( $relative && $relative !== get_post_meta( $webp_id, '_wp_attached_file', true ) ) {
+                update_post_meta( $webp_id, '_wp_attached_file', $relative );
+                $fixed++;
+            }
+        }
+
+        return $fixed;
+    }
+
+    private function guess_existing_webp_file( $webp_id, $source ) {
+        if ( ! $source ) {
+            return '';
+        }
+
+        $dir        = dirname( $source );
+        $sourcebase = pathinfo( $source, PATHINFO_FILENAME );
+        $candidates = array(
+            $dir . DIRECTORY_SEPARATOR . $sourcebase . '.webp',
+        );
+
+        $current = get_post_meta( $webp_id, '_wp_attached_file', true );
+        if ( $current ) {
+            $basename = wp_basename( $current );
+            $month    = wp_basename( dirname( wp_normalize_path( $source ) ) );
+
+            $candidates[] = $dir . DIRECTORY_SEPARATOR . $basename;
+            if ( $month && 0 === strpos( $basename, $month ) ) {
+                $candidates[] = $dir . DIRECTORY_SEPARATOR . substr( $basename, strlen( $month ) );
+            }
+        }
+
+        foreach ( array_unique( $candidates ) as $candidate ) {
+            if ( $candidate && file_exists( $candidate ) ) {
+                return $candidate;
+            }
+        }
+
+        return '';
     }
 
     private function write_file_atomic( $path, $body ) {
@@ -897,6 +1080,7 @@ final class MaoMoMo_TinyPNG_Media {
             'default_limit' => self::DEFAULT_LIMIT,
             'include_sizes' => true,
             'timeout'       => 90,
+            'proxy'         => '',
         );
 
         $settings = get_option( self::OPTION_SETTINGS, array() );
@@ -905,6 +1089,16 @@ final class MaoMoMo_TinyPNG_Media {
         }
 
         return array_merge( $defaults, $settings );
+    }
+
+    private function should_replace_compressed_file( $before, $after ) {
+        if ( $before <= 0 || $after <= 0 ) {
+            return false;
+        }
+
+        $threshold = $before < MB_IN_BYTES ? 0.8 : 0.9;
+
+        return ( $after / $before ) <= $threshold;
     }
 
     private function normalize_tokens_text( $text ) {
