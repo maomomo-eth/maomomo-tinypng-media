@@ -54,6 +54,7 @@ final class MaoMoMo_TinyPNG_Media {
 
         if ( defined( 'WP_CLI' ) && WP_CLI ) {
             WP_CLI::add_command( 'maomomo-tinypng', array( $this, 'cli_command' ) );
+            WP_CLI::add_command( 'maomomo-tinypng-fix-scaled', array( $this, 'cli_fix_scaled_originals_command' ) );
         }
     }
 
@@ -549,9 +550,9 @@ final class MaoMoMo_TinyPNG_Media {
      *
      * ## EXAMPLES
      *
-     *     wp maomomo-tinypng --mode=compress --limit=50
-     *     wp maomomo-tinypng --mode=both --after=2026-06-01
-     *     wp maomomo-tinypng 123 456,789 --mode=webp
+     *     php .\wp-cli.phar maomomo-tinypng --mode=compress --limit=50
+     *     php .\wp-cli.phar maomomo-tinypng --mode=both --after=2026-06-01
+     *     php .\wp-cli.phar maomomo-tinypng 123 456,789 --mode=webp
      */
     public function cli_command( $args, $assoc_args ) {
         if ( ! defined( 'WP_CLI' ) || ! WP_CLI ) {
@@ -619,6 +620,134 @@ final class MaoMoMo_TinyPNG_Media {
         );
     }
 
+    /**
+     * 将当前指向 -scaled 文件的附件切回不带 -scaled 的原图，并删除 -scaled 文件。
+     *
+     * ## OPTIONS
+     *
+     * [<attachment-or-file>...]
+     * : 可选附件 ID、文件名或路径，支持空格或逗号分隔。不传时扫描全部图片附件。
+     *
+     * [--dry-run]
+     * : 只预览将修复的附件，不更新数据库，不删除文件。
+     *
+     * [--yes]
+     * : 确认真实执行。没有 --dry-run 时必须传入此参数。
+     *
+     * [--keep-scaled]
+     * : 只把附件改回原图，不删除 -scaled 文件。
+     *
+     * [--no-scan-content]
+     * : 修复后不扫描文章和页面正文中的 -scaled 引用。
+     *
+     * ## EXAMPLES
+     *
+     *     php .\wp-cli.phar maomomo-tinypng-fix-scaled maomomo.com-2026-05-19_18-33-25_773340-scaled.webp --dry-run
+     *     php .\wp-cli.phar maomomo-tinypng-fix-scaled 1742 --yes
+     */
+    public function cli_fix_scaled_originals_command( $args, $assoc_args ) {
+        if ( ! defined( 'WP_CLI' ) || ! WP_CLI ) {
+            return;
+        }
+
+        $dry_run     = ! empty( $assoc_args['dry-run'] );
+        $confirmed   = ! empty( $assoc_args['yes'] );
+        $keep_scaled = ! empty( $assoc_args['keep-scaled'] );
+        $scan_content = empty( $assoc_args['no-scan-content'] );
+        $scan_targets = $this->cli_get_scaled_reference_targets( $args );
+
+        if ( ! $dry_run && ! $confirmed ) {
+            WP_CLI::error( '此操作会更新附件路径并删除 -scaled 文件。请先使用 --dry-run 预览，确认后加 --yes 执行。' );
+        }
+
+        $lookup = $this->cli_get_scaled_attachment_ids( $args );
+        foreach ( $lookup['missing'] as $target ) {
+            WP_CLI::warning( '没有找到匹配的附件：' . $target );
+        }
+
+        $ids = $lookup['ids'];
+        if ( empty( $ids ) ) {
+            if ( $scan_content && ! empty( $scan_targets ) ) {
+                $this->cli_report_scaled_references( $scan_targets );
+            }
+
+            WP_CLI::warning( '没有找到需要修复的 -scaled 附件。' );
+            return;
+        }
+
+        $summary = array(
+            'ok'      => 0,
+            'failed'  => 0,
+            'skipped' => 0,
+            'deleted' => 0,
+        );
+        $scaled_paths = array();
+
+        WP_CLI::log(
+            sprintf(
+                '准备修复 %d 个附件%s%s。',
+                count( $ids ),
+                $dry_run ? '，dry-run' : '',
+                $keep_scaled ? '，保留 -scaled 文件' : ''
+            )
+        );
+
+        $progress = \WP_CLI\Utils\make_progress_bar( 'Fix scaled originals', count( $ids ) );
+
+        foreach ( $ids as $attachment_id ) {
+            $result = $this->restore_scaled_original_attachment( (int) $attachment_id, $dry_run, ! $keep_scaled );
+
+            if ( is_wp_error( $result ) ) {
+                $summary['failed']++;
+                WP_CLI::warning( sprintf( '#%d %s', $attachment_id, $result->get_error_message() ) );
+                $progress->tick();
+                continue;
+            }
+
+            if ( empty( $result['changed'] ) ) {
+                $summary['skipped']++;
+            } else {
+                $summary['ok']++;
+            }
+
+            if ( ! empty( $result['deleted'] ) ) {
+                $summary['deleted']++;
+            }
+
+            if ( ! empty( $result['scaled'] ) ) {
+                $scaled_paths[] = $result['scaled'];
+            }
+
+            WP_CLI::log(
+                sprintf(
+                    '#%d %s -> %s%s',
+                    $attachment_id,
+                    $result['scaled'],
+                    $result['original'],
+                    ! empty( $result['message'] ) ? '；' . $result['message'] : ''
+                )
+            );
+
+            $progress->tick();
+        }
+
+        $progress->finish();
+
+        if ( $scan_content ) {
+            $this->cli_report_scaled_references( array_merge( $scan_targets, $scaled_paths ) );
+        }
+
+        WP_CLI::success(
+            sprintf(
+                '修复完成：成功 %d，失败 %d，跳过 %d，删除 -scaled 文件 %d。',
+                (int) $summary['ok'],
+                (int) $summary['failed'],
+                (int) $summary['skipped'],
+                (int) $summary['deleted']
+            )
+        );
+    }
+
     private function cli_get_attachment_ids( $args, $assoc_args ) {
         if ( ! empty( $args ) ) {
             $ids = array();
@@ -664,6 +793,402 @@ final class MaoMoMo_TinyPNG_Media {
         }
 
         return $ids;
+    }
+
+    private function cli_get_scaled_attachment_ids( $args ) {
+        $ids           = array();
+        $wanted        = array();
+        $numeric_ids   = array();
+        $missing       = array();
+        $has_targets   = ! empty( $args );
+        $normalized_in = array();
+
+        foreach ( (array) $args as $arg ) {
+            foreach ( explode( ',', (string) $arg ) as $target ) {
+                $target = trim( $target );
+                if ( '' === $target ) {
+                    continue;
+                }
+
+                if ( ctype_digit( $target ) ) {
+                    $numeric_ids[] = absint( $target );
+                    continue;
+                }
+
+                $key                    = $this->normalize_cli_file_target( $target );
+                $wanted[ $key ]         = $target;
+                $normalized_in[ $key ]  = true;
+                $basename               = $this->normalize_cli_file_target( wp_basename( $target ) );
+                $normalized_in[ $basename ] = true;
+            }
+        }
+
+        $ids = $numeric_ids;
+
+        $query = new WP_Query(
+            array(
+                'post_type'      => 'attachment',
+                'post_status'    => 'inherit',
+                'post_mime_type' => 'image',
+                'posts_per_page' => -1,
+                'fields'         => 'ids',
+                'orderby'        => 'ID',
+                'order'          => 'ASC',
+            )
+        );
+
+        foreach ( $query->posts as $attachment_id ) {
+            $attachment_id = (int) $attachment_id;
+            $file          = get_attached_file( $attachment_id, true );
+            if ( ! $file ) {
+                continue;
+            }
+
+            if ( $has_targets ) {
+                $relative = $this->attachment_relative_path( $file );
+                $candidates = array(
+                    $this->normalize_cli_file_target( $file ),
+                    $this->normalize_cli_file_target( $relative ),
+                    $this->normalize_cli_file_target( wp_basename( $file ) ),
+                );
+
+                foreach ( $candidates as $candidate ) {
+                    if ( isset( $normalized_in[ $candidate ] ) ) {
+                        $ids[] = $attachment_id;
+                        unset( $wanted[ $candidate ] );
+                    }
+                }
+                continue;
+            }
+
+            if ( $this->has_scaled_original_candidate( $attachment_id ) ) {
+                $ids[] = $attachment_id;
+            }
+        }
+
+        foreach ( $wanted as $target ) {
+            $missing[] = $target;
+        }
+
+        return array(
+            'ids'     => array_values( array_unique( array_filter( array_map( 'absint', $ids ) ) ) ),
+            'missing' => array_values( array_unique( $missing ) ),
+        );
+    }
+
+    private function cli_get_scaled_reference_targets( $args ) {
+        $targets = array();
+
+        foreach ( (array) $args as $arg ) {
+            foreach ( explode( ',', (string) $arg ) as $target ) {
+                $target = trim( $target );
+                if ( '' === $target || ctype_digit( $target ) ) {
+                    continue;
+                }
+
+                if ( false === strpos( wp_basename( $target ), '-scaled.' ) ) {
+                    continue;
+                }
+
+                $targets[] = $target;
+            }
+        }
+
+        return array_values( array_unique( $targets ) );
+    }
+
+    private function cli_report_scaled_references( $scaled_paths ) {
+        $references = $this->scan_posts_pages_for_scaled_references( $scaled_paths );
+        if ( empty( $references ) ) {
+            WP_CLI::log( '未发现 post/page 正文继续引用这些 -scaled 文件。' );
+            return;
+        }
+
+        WP_CLI::warning( sprintf( '发现 %d 篇 post/page 正文仍引用 -scaled 文件：', count( $references ) ) );
+        foreach ( $references as $reference ) {
+            WP_CLI::warning(
+                sprintf(
+                    '#%d [%s] %s：%s',
+                    (int) $reference['id'],
+                    $reference['type'],
+                    $reference['title'],
+                    implode( ', ', $reference['files'] )
+                )
+            );
+        }
+    }
+
+    private function normalize_cli_file_target( $target ) {
+        return strtolower( wp_normalize_path( trim( (string) $target ) ) );
+    }
+
+    private function has_scaled_original_candidate( $attachment_id ) {
+        $paths = $this->get_scaled_original_paths( $attachment_id );
+        return ! is_wp_error( $paths );
+    }
+
+    private function restore_scaled_original_attachment( $attachment_id, $dry_run, $delete_scaled ) {
+        $paths = $this->get_scaled_original_paths( $attachment_id );
+        if ( is_wp_error( $paths ) ) {
+            return $paths;
+        }
+
+        $scaled   = $paths['scaled'];
+        $original = $paths['original'];
+
+        $new_relative = $this->attachment_relative_path( $original );
+        $conflict_id  = $this->find_attachment_by_relative_file( $new_relative, $attachment_id );
+        if ( $conflict_id ) {
+            return new WP_Error(
+                'maomomo_tinypng_scaled_conflict',
+                sprintf( '原图文件已被附件 #%d 使用：%s', $conflict_id, $new_relative )
+            );
+        }
+
+        if ( $dry_run ) {
+            return array(
+                'changed'  => true,
+                'deleted'  => false,
+                'scaled'   => $scaled,
+                'original' => $original,
+                'message'  => $delete_scaled ? '将更新附件并删除 -scaled 文件' : '将更新附件并保留 -scaled 文件',
+            );
+        }
+
+        $metadata = wp_get_attachment_metadata( $attachment_id );
+        if ( ! is_array( $metadata ) ) {
+            $metadata = $this->build_basic_image_metadata( $original );
+        }
+
+        $metadata['file'] = $new_relative;
+        unset( $metadata['original_image'] );
+
+        $size = wp_getimagesize( $original );
+        if ( is_array( $size ) ) {
+            $metadata['width']  = (int) $size[0];
+            $metadata['height'] = (int) $size[1];
+        }
+        $metadata['filesize'] = file_exists( $original ) ? filesize( $original ) : 0;
+
+        update_post_meta( $attachment_id, '_wp_attached_file', $new_relative );
+        wp_update_attachment_metadata( $attachment_id, $metadata );
+
+        $filetype = wp_check_filetype( $original );
+        if ( ! empty( $filetype['type'] ) ) {
+            wp_update_post(
+                array(
+                    'ID'             => $attachment_id,
+                    'post_mime_type' => $filetype['type'],
+                )
+            );
+        }
+
+        $deleted = false;
+        if ( $delete_scaled ) {
+            $delete_result = $this->delete_scaled_file( $scaled, $original );
+            if ( is_wp_error( $delete_result ) ) {
+                return $delete_result;
+            }
+            $deleted = (bool) $delete_result;
+        }
+
+        return array(
+            'changed'  => true,
+            'deleted'  => $deleted,
+            'scaled'   => $scaled,
+            'original' => $original,
+            'message'  => $deleted ? '已更新附件并删除 -scaled 文件' : '已更新附件',
+        );
+    }
+
+    private function get_scaled_original_paths( $attachment_id ) {
+        $scaled = get_attached_file( $attachment_id, true );
+        if ( ! $scaled ) {
+            return new WP_Error( 'maomomo_tinypng_scaled_missing_attachment_file', '附件没有记录文件路径。' );
+        }
+
+        if ( ! file_exists( $scaled ) ) {
+            return new WP_Error( 'maomomo_tinypng_scaled_missing_file', '当前 -scaled 文件不存在：' . $scaled );
+        }
+
+        if ( ! $this->is_supported_path( $scaled ) ) {
+            return new WP_Error( 'maomomo_tinypng_scaled_unsupported', '附件不是支持的图片类型：' . $scaled );
+        }
+
+        $suffix_original = $this->remove_scaled_suffix_from_path( $scaled );
+        if ( '' === $suffix_original ) {
+            return new WP_Error( 'maomomo_tinypng_scaled_not_scaled', '当前附件文件名不含 -scaled：' . $scaled );
+        }
+
+        $original = '';
+        if ( function_exists( 'wp_get_original_image_path' ) ) {
+            $candidate = wp_get_original_image_path( $attachment_id );
+            if ( $candidate && wp_normalize_path( $candidate ) !== wp_normalize_path( $scaled ) ) {
+                $original = $candidate;
+            }
+        }
+
+        $metadata = wp_get_attachment_metadata( $attachment_id );
+        if ( ! $original && is_array( $metadata ) && ! empty( $metadata['original_image'] ) ) {
+            $original = dirname( $scaled ) . DIRECTORY_SEPARATOR . wp_basename( $metadata['original_image'] );
+        }
+
+        if ( ! $original ) {
+            $original = $suffix_original;
+        }
+
+        if ( ! $original || wp_normalize_path( $original ) === wp_normalize_path( $scaled ) ) {
+            return new WP_Error( 'maomomo_tinypng_scaled_not_scaled', '当前附件文件名不含 -scaled：' . $scaled );
+        }
+
+        if ( ! file_exists( $original ) ) {
+            return new WP_Error( 'maomomo_tinypng_scaled_original_missing', '找不到不带 -scaled 的原图：' . $original );
+        }
+
+        if ( ! $this->is_supported_path( $original ) ) {
+            return new WP_Error( 'maomomo_tinypng_scaled_original_unsupported', '原图不是支持的图片类型：' . $original );
+        }
+
+        return array(
+            'scaled'   => $scaled,
+            'original' => $original,
+        );
+    }
+
+    private function remove_scaled_suffix_from_path( $path ) {
+        $dir       = dirname( $path );
+        $extension = pathinfo( $path, PATHINFO_EXTENSION );
+        $filename  = pathinfo( $path, PATHINFO_FILENAME );
+
+        if ( ! preg_match( '/-scaled$/', $filename ) ) {
+            return '';
+        }
+
+        $original_name = preg_replace( '/-scaled$/', '', $filename ) . ( $extension ? '.' . $extension : '' );
+
+        return $dir . DIRECTORY_SEPARATOR . $original_name;
+    }
+
+    private function find_attachment_by_relative_file( $relative, $exclude_id ) {
+        if ( '' === $relative ) {
+            return 0;
+        }
+
+        $query = new WP_Query(
+            array(
+                'post_type'      => 'attachment',
+                'post_status'    => 'inherit',
+                'posts_per_page' => 1,
+                'fields'         => 'ids',
+                'meta_key'       => '_wp_attached_file',
+                'meta_value'     => $relative,
+                'post__not_in'   => array( (int) $exclude_id ),
+            )
+        );
+
+        return ! empty( $query->posts ) ? (int) $query->posts[0] : 0;
+    }
+
+    private function delete_scaled_file( $scaled, $original ) {
+        if ( wp_normalize_path( $scaled ) === wp_normalize_path( $original ) ) {
+            return new WP_Error( 'maomomo_tinypng_scaled_same_file', '安全检查失败：-scaled 文件和原图路径相同。' );
+        }
+
+        if ( ! file_exists( $scaled ) ) {
+            return false;
+        }
+
+        if ( ! $this->is_path_in_uploads( $scaled ) ) {
+            return new WP_Error( 'maomomo_tinypng_scaled_outside_uploads', '安全检查失败：文件不在 uploads 目录中：' . $scaled );
+        }
+
+        if ( '' === $this->remove_scaled_suffix_from_path( $scaled ) ) {
+            return new WP_Error( 'maomomo_tinypng_scaled_delete_name', '安全检查失败：目标文件名不含 -scaled：' . $scaled );
+        }
+
+        if ( ! @unlink( $scaled ) ) {
+            return new WP_Error( 'maomomo_tinypng_scaled_delete_failed', '删除 -scaled 文件失败：' . $scaled );
+        }
+
+        clearstatcache( true, $scaled );
+        return ! file_exists( $scaled );
+    }
+
+    private function scan_posts_pages_for_scaled_references( $scaled_paths ) {
+        $needles = $this->build_scaled_reference_needles( $scaled_paths );
+        if ( empty( $needles ) ) {
+            return array();
+        }
+
+        $query = new WP_Query(
+            array(
+                'post_type'      => array( 'post', 'page' ),
+                'post_status'    => 'any',
+                'posts_per_page' => -1,
+                'fields'         => 'ids',
+                'orderby'        => 'ID',
+                'order'          => 'ASC',
+            )
+        );
+
+        $references = array();
+
+        foreach ( $query->posts as $post_id ) {
+            $post = get_post( (int) $post_id );
+            if ( ! $post instanceof WP_Post || '' === (string) $post->post_content ) {
+                continue;
+            }
+
+            $matched = array();
+            foreach ( $needles as $file => $candidates ) {
+                foreach ( $candidates as $candidate ) {
+                    if ( '' !== $candidate && false !== strpos( $post->post_content, $candidate ) ) {
+                        $matched[] = $file;
+                        break;
+                    }
+                }
+            }
+
+            if ( empty( $matched ) ) {
+                continue;
+            }
+
+            $references[] = array(
+                'id'    => (int) $post->ID,
+                'type'  => (string) $post->post_type,
+                'title' => get_the_title( $post ) ? get_the_title( $post ) : '(无标题)',
+                'files' => array_values( array_unique( $matched ) ),
+            );
+        }
+
+        return $references;
+    }
+
+    private function build_scaled_reference_needles( $scaled_paths ) {
+        $upload_dir = wp_upload_dir();
+        $base_url   = isset( $upload_dir['baseurl'] ) ? untrailingslashit( $upload_dir['baseurl'] ) : '';
+        $needles    = array();
+
+        foreach ( array_unique( array_filter( (array) $scaled_paths ) ) as $path ) {
+            $file     = wp_basename( $path );
+            $relative = $this->attachment_relative_path( $path );
+
+            $candidates = array(
+                $file,
+                $relative,
+                str_replace( '/', '\/', $relative ),
+            );
+
+            if ( $base_url && $relative ) {
+                $url          = $base_url . '/' . ltrim( $relative, '/' );
+                $candidates[] = $url;
+                $candidates[] = str_replace( '/', '\/', $url );
+            }
+
+            $needles[ $file ] = array_values( array_unique( array_filter( $candidates ) ) );
+        }
+
+        return $needles;
     }
 
     private function media_action_link( $attachment_id, $mode, $label ) {
@@ -1174,6 +1699,14 @@ final class MaoMoMo_TinyPNG_Media {
         }
 
         return wp_basename( $path );
+    }
+
+    private function is_path_in_uploads( $path ) {
+        $upload_dir = wp_upload_dir();
+        $base_dir   = wp_normalize_path( trailingslashit( $upload_dir['basedir'] ) );
+        $path       = wp_normalize_path( $path );
+
+        return 0 === strpos( $path, $base_dir );
     }
 
     private function fix_generated_webp_paths() {
