@@ -55,11 +55,17 @@ Stable tag: 1.2.0
 
 修复已经指向 `-scaled` 文件的附件，改为使用不带 `-scaled` 的原图，并删除 `-scaled` 文件：
 
-`php .\wp-cli.phar maomomo-tinypng-fix-scaled maomomo.com-2026-05-19_18-33-25_773340-scaled.webp maomomo.com-2025-06-01_22-19-03_166492-scaled.jpg maomomo.com-2025-05-21_18-50-34_124507-scaled.png --yes`
+`php .\wp-cli.phar maomomo-tinypng-fix-scaled --yes`
 
 建议先预览：
 
-`php .\wp-cli.phar maomomo-tinypng-fix-scaled maomomo.com-2026-05-19_18-33-25_773340-scaled.webp maomomo.com-2025-06-01_22-19-03_166492-scaled.jpg maomomo.com-2025-05-21_18-50-34_124507-scaled.png --dry-run`
+`php .\wp-cli.phar maomomo-tinypng-fix-scaled --dry-run`
+
+只修复指定附件 ID 或指定文件名：
+
+`php .\wp-cli.phar maomomo-tinypng-fix-scaled 1742 --dry-run`
+
+`php .\wp-cli.phar maomomo-tinypng-fix-scaled maomomo.com-2026-05-19_18-33-25_773340-scaled.webp --dry-run`
 
 参数说明：
 
