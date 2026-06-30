@@ -2,7 +2,7 @@
 Contributors: maomomo
 Requires at least: 5.8
 Requires PHP: 7.4
-Stable tag: 1.3.0
+Stable tag: 1.3.1
 
 在 WordPress 媒体库中使用多个 TinyPNG API Token 轮换压缩图片，并支持转换 WebP。
 
@@ -11,7 +11,7 @@ Stable tag: 1.3.0
 * 设置页支持配置任意数量 TinyPNG API Token。
 * 支持一行一个 Token，或 `名称|TOKEN|月额度`。
 * 媒体库列表支持单张图片：TinyPNG 压缩、转 WebP、压缩+WebP。
-* 媒体库批量操作支持：压缩、转 WebP、压缩并转 WebP。
+* 媒体库批量操作支持异步加入后台队列：压缩、转 WebP、压缩并转 WebP。
 * 支持 WP-CLI 批量执行压缩/转换，适合大批量后台处理。
 * 支持 WP-CLI 将 `-scaled` 附件切回不带 `-scaled` 的原图，并删除 `-scaled` 文件。
 * 默认压缩原图和 WordPress 已生成的缩略图尺寸。
@@ -28,7 +28,7 @@ Stable tag: 1.3.0
 3. 填写一个或多个 TinyPNG API Token。
 4. 如需代理，在代理地址中填写 HTTP/HTTPS/SOCKS5 代理。
 5. 如需新上传图片自动处理，在「上传后自动处理」中选择模式；启用后图片会先加入后台队列。
-6. 到「媒体 → 媒体库」使用行操作或批量操作。
+6. 到「媒体 → 媒体库」使用行操作或批量操作；批量操作会先加入后台队列。
 
 如果站点访问量很低，WP-Cron 可能延迟触发。生产环境建议用系统 cron 定时访问 `wp-cron.php`，或用 WP-CLI 定时运行 WordPress cron。
 

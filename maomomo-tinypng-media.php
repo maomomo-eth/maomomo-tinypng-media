@@ -3,7 +3,7 @@
  * Plugin Name: MaoMoMo TinyPNG Media
  * Plugin URI: https://www.maomomo.com
  * Description: 在媒体库中使用多个 TinyPNG API Token 轮换压缩图片，并支持转换 WebP。
- * Version: 1.3.0
+ * Version: 1.3.1
  * Author: MAOMOMO
  * Author URI: https://www.maomomo.com
  * Requires at least: 5.8
@@ -361,25 +361,42 @@ final class MaoMoMo_TinyPNG_Media {
             return $redirect_to;
         }
 
-        @set_time_limit( 0 );
-
-        $summary = $this->empty_summary();
-        $mode    = $map[ $action ];
+        $mode     = $map[ $action ];
+        $queued   = 0;
+        $failed   = 0;
+        $skipped  = 0;
+        $messages = array();
 
         foreach ( (array) $post_ids as $post_id ) {
             $post_id = absint( $post_id );
             if ( ! $post_id || ! current_user_can( 'edit_post', $post_id ) ) {
-                $summary['failed']++;
-                $summary['messages'][] = '跳过无权限附件：' . $post_id;
+                $failed++;
+                $messages[] = '跳过无权限附件：' . $post_id;
                 continue;
             }
 
-            $result = $this->process_attachment( $post_id, $mode );
-            $this->merge_summary( $summary, $result );
+            if ( ! $this->is_supported_attachment( $post_id ) ) {
+                $skipped++;
+                $messages[] = '跳过不支持的附件：#' . $post_id;
+                continue;
+            }
+
+            if ( $this->enqueue_attachment( $post_id, $mode, 1 ) ) {
+                $queued++;
+                continue;
+            }
+
+            $failed++;
+            $messages[] = '附件 #' . $post_id . ' 加入后台队列失败。';
         }
 
-        $type = $summary['failed'] ? 'warning' : 'success';
-        $this->store_notice( $type, $this->format_summary_message( $summary ) );
+        if ( $queued > 0 ) {
+            $type = $failed ? 'warning' : 'success';
+        } else {
+            $type = $failed ? 'error' : 'warning';
+        }
+
+        $this->store_notice( $type, $this->format_enqueue_message( $mode, $queued, $failed, $skipped, $messages ) );
 
         return $redirect_to;
     }
@@ -2403,6 +2420,23 @@ final class MaoMoMo_TinyPNG_Media {
 
         if ( ! empty( $summary['messages'] ) ) {
             $items = array_slice( array_unique( $summary['messages'] ), 0, 5 );
+            $message .= '<br>' . esc_html( implode( '；', $items ) );
+        }
+
+        return $message;
+    }
+
+    private function format_enqueue_message( $mode, $queued, $failed, $skipped, $messages ) {
+        $message = sprintf(
+            'TinyPNG %s 已加入后台队列：排队 %d，失败 %d，跳过 %d。WP-Cron 会异步处理，可在媒体库 TinyPNG 列查看状态。',
+            esc_html( $this->mode_label( $mode ) ),
+            (int) $queued,
+            (int) $failed,
+            (int) $skipped
+        );
+
+        if ( ! empty( $messages ) ) {
+            $items = array_slice( array_unique( $messages ), 0, 5 );
             $message .= '<br>' . esc_html( implode( '；', $items ) );
         }
 
