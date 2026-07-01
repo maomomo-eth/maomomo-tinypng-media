@@ -3,7 +3,7 @@
  * Plugin Name: MaoMoMo TinyPNG Media
  * Plugin URI: https://www.maomomo.com
  * Description: 在媒体库中使用多个 TinyPNG API Token 轮换压缩图片，并支持转换 WebP。
- * Version: 1.3.2
+ * Version: 1.3.3
  * Author: MAOMOMO
  * Author URI: https://www.maomomo.com
  * Requires at least: 5.8
@@ -21,10 +21,11 @@ final class MaoMoMo_TinyPNG_Media {
     const NOTICE_PREFIX   = 'maomomo_tinypng_media_notice_';
     const API_ENDPOINT    = 'https://api.tinify.com/shrink';
     const DEFAULT_LIMIT   = 500;
-    const QUEUE_HOOK         = 'maomomo_tinypng_process_queue';
-    const QUEUE_LOCK         = 'maomomo_tinypng_queue_lock';
-    const QUEUE_BATCH        = 1;
-    const QUEUE_MAX_ATTEMPTS = 5;
+    const QUEUE_HOOK           = 'maomomo_tinypng_process_queue';
+    const QUEUE_LOCK           = 'maomomo_tinypng_queue_lock';
+    const QUEUE_SCHEDULER_LOCK = 'maomomo_tinypng_queue_scheduler_lock';
+    const QUEUE_BATCH          = 1;
+    const QUEUE_MAX_ATTEMPTS   = 5;
 
     const META_QUEUE_STATUS     = '_maomomo_tinypng_queue_status';
     const META_QUEUE_MODE       = '_maomomo_tinypng_queue_mode';
@@ -57,6 +58,7 @@ final class MaoMoMo_TinyPNG_Media {
         add_action( 'admin_notices', array( $this, 'render_admin_notice' ) );
         add_action( 'http_api_curl', array( $this, 'apply_tinypng_proxy' ), 10, 3 );
         add_action( self::QUEUE_HOOK, array( $this, 'process_queue' ) );
+        add_action( 'init', array( $this, 'maybe_schedule_queue_event' ), 20 );
 
         add_filter( 'wp_generate_attachment_metadata', array( $this, 'auto_process_uploaded_attachment' ), 20, 2 );
         add_filter( 'media_row_actions', array( $this, 'add_media_row_actions' ), 10, 3 );
@@ -550,6 +552,7 @@ final class MaoMoMo_TinyPNG_Media {
 
     public function process_queue() {
         if ( get_transient( self::QUEUE_LOCK ) ) {
+            $this->schedule_queue_event( 60 );
             return;
         }
 
@@ -570,6 +573,28 @@ final class MaoMoMo_TinyPNG_Media {
 
         if ( $this->has_due_queue_items() ) {
             $this->schedule_queue_event( 15 );
+            return;
+        }
+
+        $next_delay = $this->get_next_queue_delay();
+        if ( $next_delay > 0 ) {
+            $this->schedule_queue_event( $next_delay );
+        }
+    }
+
+    public function maybe_schedule_queue_event() {
+        if ( wp_next_scheduled( self::QUEUE_HOOK ) ) {
+            return;
+        }
+
+        if ( get_transient( self::QUEUE_SCHEDULER_LOCK ) ) {
+            return;
+        }
+
+        set_transient( self::QUEUE_SCHEDULER_LOCK, (string) time(), MINUTE_IN_SECONDS );
+
+        if ( $this->has_due_queue_items() || $this->has_stale_running_queue_items() ) {
+            $this->schedule_queue_event( 1 );
             return;
         }
 
@@ -1514,6 +1539,33 @@ final class MaoMoMo_TinyPNG_Media {
             update_post_meta( (int) $attachment_id, self::META_QUEUE_LAST_ERROR, '上次后台处理超时，已重新排队。' );
             update_post_meta( (int) $attachment_id, self::META_QUEUE_UPDATED_AT, time() );
         }
+    }
+
+    private function has_stale_running_queue_items() {
+        $query = new WP_Query(
+            array(
+                'post_type'      => 'attachment',
+                'post_status'    => 'inherit',
+                'post_mime_type' => 'image',
+                'posts_per_page' => 1,
+                'fields'         => 'ids',
+                'meta_query'     => array(
+                    array(
+                        'key'   => self::META_QUEUE_STATUS,
+                        'value' => 'running',
+                    ),
+                    array(
+                        'key'     => self::META_QUEUE_STARTED_AT,
+                        'value'   => time() - ( 30 * MINUTE_IN_SECONDS ),
+                        'compare' => '<=',
+                        'type'    => 'NUMERIC',
+                    ),
+                ),
+                'no_found_rows'  => true,
+            )
+        );
+
+        return ! empty( $query->posts );
     }
 
     private function fail_non_retryable_pending_queue_items() {
