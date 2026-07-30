@@ -2,7 +2,7 @@
 Contributors: maomomo
 Requires at least: 5.8
 Requires PHP: 7.4
-Stable tag: 1.4.0
+Stable tag: 1.5.0
 
 在 WordPress 媒体库中使用多个 TinyPNG API Token 轮换压缩图片，并支持转换 WebP。
 
@@ -18,6 +18,7 @@ Stable tag: 1.4.0
 * 可选上传后自动处理：不自动处理、自动压缩、自动转 WebP、自动压缩并转 WebP。
 * 上传后自动处理使用后台队列和 WP-Cron 异步执行，上传请求不等待 TinyPNG API 返回。
 * 后台队列按附件级 3 Worker 并发处理；同一附件只会由一个 Worker 领取，附件内原图和缩略图保持串行。
+* 支持从 GitHub Release 检查新版，并在 WordPress 插件页面一键升级。
 * 转 WebP 会创建新的 WebP 附件，并和原附件互相关联。
 * 支持 TinyPNG API 专用代理设置。
 * 压缩收益不足时自动保留原图：小于 1MB 的图片压缩后大于原图 80% 不覆盖；大于等于 1MB 的图片压缩后大于原图 90% 不覆盖。
@@ -96,3 +97,12 @@ TOKEN_2
 == 说明 ==
 
 插件使用 TinyPNG HTTP API，不依赖 Composer。压缩会覆盖原图及缩略图文件；转换 WebP 会保留原图并新增 WebP 附件。
+
+从 1.5.0 开始，插件支持在 WordPress 后台检查并安装 GitHub 正式 Release。1.4.0 及更早版本尚未包含更新检查器，需要先手动安装一次 1.5.0 或更高版本。
+
+== 更新日志 ==
+
+= 1.5.0 =
+
+* 接入 GitHub Release 更新检查，支持 WordPress 后台一键升级。
+* 发布包仅接受名为 `maomomo-tinypng-media.zip` 的正式 Release 附件。

@@ -1,0 +1,57 @@
+name: 发布 WordPress 插件
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 校验版本号
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_version="${GITHUB_REF_NAME#v}"
+          plugin_version="$(sed -n 's/^ \* Version: //p' maomomo-tinypng-media.php | head -n 1)"
+          stable_tag="$(sed -n 's/^Stable tag: //p' readme.txt | head -n 1)"
+
+          if [[ -z "${release_version}" || "${plugin_version}" != "${release_version}" || "${stable_tag}" != "${release_version}" ]]; then
+            echo "Tag、插件 Version 和 readme Stable tag 必须一致。" >&2
+            echo "Tag=${release_version}, Version=${plugin_version}, Stable tag=${stable_tag}" >&2
+            exit 1
+          fi
+
+      - name: 打包插件
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          git archive \
+            --format=zip \
+            --prefix=maomomo-tinypng-media/ \
+            --output=dist/maomomo-tinypng-media.zip \
+            HEAD
+          cd dist
+          sha256sum maomomo-tinypng-media.zip > maomomo-tinypng-media.zip.sha256
+
+      - name: 创建 GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/maomomo-tinypng-media.zip \
+            dist/maomomo-tinypng-media.zip.sha256 \
+            --verify-tag \
+            --generate-notes \
+            --title "MaoMoMo TinyPNG Media ${GITHUB_REF_NAME}"

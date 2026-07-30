@@ -3,17 +3,23 @@
  * Plugin Name: MaoMoMo TinyPNG Media
  * Plugin URI: https://www.maomomo.com
  * Description: 在媒体库中使用多个 TinyPNG API Token 轮换压缩图片，并支持转换 WebP。
- * Version: 1.4.0
+ * Version: 1.5.0
  * Author: MAOMOMO
  * Author URI: https://www.maomomo.com
  * Requires at least: 5.8
  * Requires PHP: 7.4
+ * Update URI: https://github.com/maomomo-eth/maomomo-tinypng-media
  * Text Domain: maomomo-tinypng-media
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
+
+require_once __DIR__ . '/lib/plugin-update-checker/plugin-update-checker.php';
+require_once __DIR__ . '/includes/class-maomomo-github-updater.php';
+
+MaoMoMo_GitHub_Updater::init( __FILE__ );
 
 final class MaoMoMo_TinyPNG_Media {
     const OPTION_SETTINGS = 'maomomo_tinypng_media_settings';
