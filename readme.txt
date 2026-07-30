@@ -2,7 +2,7 @@
 Contributors: maomomo
 Requires at least: 5.8
 Requires PHP: 7.4
-Stable tag: 1.5.0
+Stable tag: 1.6.0
 
 在 WordPress 媒体库中使用多个 TinyPNG API Token 轮换压缩图片，并支持转换 WebP。
 
@@ -16,8 +16,8 @@ Stable tag: 1.5.0
 * 支持 WP-CLI 将 `-scaled` 附件切回不带 `-scaled` 的原图，并删除 `-scaled` 文件。
 * 默认压缩原图和 WordPress 已生成的缩略图尺寸。
 * 可选上传后自动处理：不自动处理、自动压缩、自动转 WebP、自动压缩并转 WebP。
-* 上传后自动处理使用后台队列和 WP-Cron 异步执行，上传请求不等待 TinyPNG API 返回。
-* 后台队列按附件级 3 Worker 并发处理；同一附件只会由一个 Worker 领取，附件内原图和缩略图保持串行。
+* 上传后自动处理使用后台队列和系统 Cron 异步执行，上传请求不等待 TinyPNG API 返回。
+* 后台队列由 3 个独立 WP-CLI Worker 并发处理；同一附件只会由一个 Worker 领取，附件内原图和缩略图保持串行。
 * 支持从 GitHub Release 检查新版，并在 WordPress 插件页面一键升级。
 * 转 WebP 会创建新的 WebP 附件，并和原附件互相关联。
 * 支持 TinyPNG API 专用代理设置。
@@ -32,7 +32,19 @@ Stable tag: 1.5.0
 5. 如需新上传图片自动处理，在「上传后自动处理」中选择模式；启用后图片会先加入后台队列。
 6. 到「媒体 → 媒体库」使用行操作或批量操作；批量操作会先加入后台队列。
 
-如果站点访问量很低，WP-Cron 可能延迟触发。生产环境建议用系统 cron 定时访问 `wp-cron.php`，或用 WP-CLI 定时运行 WordPress cron。3 Worker 通过站点自身的 `admin-ajax.php` 非阻塞回环请求运行，因此服务器需要允许 WordPress 访问自己的站点地址。
+自动处理需要配置下方 3 条系统 Cron。WP-Cron 只维护和回收异常队列状态，不再通过 `admin-ajax.php` 回环请求执行图片任务。
+
+== 系统 Cron 3 Worker ==
+
+将 `/网站目录` 替换成 WordPress 根目录，并确认 PHP CLI 路径正确：
+
+`* * * * * flock -n /tmp/maomomo-worker-1.lock php /网站目录/wp-cli.phar --path=/网站目录 maomomo-tinypng-worker --slot=1 --time-limit=50 >/dev/null 2>&1`
+
+`* * * * * flock -n /tmp/maomomo-worker-2.lock php /网站目录/wp-cli.phar --path=/网站目录 maomomo-tinypng-worker --slot=2 --time-limit=50 >/dev/null 2>&1`
+
+`* * * * * flock -n /tmp/maomomo-worker-3.lock php /网站目录/wp-cli.phar --path=/网站目录 maomomo-tinypng-worker --slot=3 --time-limit=50 >/dev/null 2>&1`
+
+每个槽位同时只允许运行一个进程；即使上一分钟的任务尚未结束，也不会重复启动同槽位 Worker。插件内部还有 MySQL 槽位锁和附件领取锁，防止同一附件被重复处理。
 
 == WP-CLI 用法 ==
 
@@ -101,6 +113,12 @@ TOKEN_2
 从 1.5.0 开始，插件支持在 WordPress 后台检查并安装 GitHub 正式 Release。1.4.0 及更早版本尚未包含更新检查器，需要先手动安装一次 1.5.0 或更高版本。
 
 == 更新日志 ==
+
+= 1.6.0 =
+
+* 3 Worker 改为独立 WP-CLI 系统 Cron 进程，不再依赖站点回环访问 `admin-ajax.php`。
+* 新增 `maomomo-tinypng-worker` 命令，支持 `--slot`、`--time-limit` 和 `--max-jobs`。
+* 自动回收 1.5.0 中已经领取但未成功启动的 Worker 任务。
 
 = 1.5.0 =
 

@@ -3,7 +3,7 @@
  * Plugin Name: MaoMoMo TinyPNG Media
  * Plugin URI: https://www.maomomo.com
  * Description: 在媒体库中使用多个 TinyPNG API Token 轮换压缩图片，并支持转换 WebP。
- * Version: 1.5.0
+ * Version: 1.6.0
  * Author: MAOMOMO
  * Author URI: https://www.maomomo.com
  * Requires at least: 5.8
@@ -27,19 +27,20 @@ final class MaoMoMo_TinyPNG_Media {
     const NOTICE_PREFIX   = 'maomomo_tinypng_media_notice_';
     const API_ENDPOINT    = 'https://api.tinify.com/shrink';
     const DEFAULT_LIMIT   = 500;
-    const QUEUE_HOOK           = 'maomomo_tinypng_process_queue';
-    const QUEUE_WORKER_ACTION  = 'maomomo_tinypng_queue_worker';
-    const QUEUE_LOCK           = 'maomomo_tinypng_queue_lock';
-    const QUEUE_SCHEDULER_LOCK = 'maomomo_tinypng_queue_scheduler_lock';
-    const QUEUE_WORKERS        = 3;
-    const QUEUE_MAX_ATTEMPTS   = 5;
-    const QUEUE_STALE_AFTER    = 30 * MINUTE_IN_SECONDS;
+    const QUEUE_HOOK               = 'maomomo_tinypng_process_queue';
+    const QUEUE_LOCK               = 'maomomo_tinypng_queue_lock';
+    const QUEUE_SCHEDULER_LOCK     = 'maomomo_tinypng_queue_scheduler_lock';
+    const QUEUE_WORKERS            = 3;
+    const QUEUE_MAX_ATTEMPTS       = 5;
+    const QUEUE_WORKER_START_GRACE = 2 * MINUTE_IN_SECONDS;
+    const QUEUE_STALE_AFTER        = 30 * MINUTE_IN_SECONDS;
 
     const META_QUEUE_STATUS     = '_maomomo_tinypng_queue_status';
     const META_QUEUE_MODE       = '_maomomo_tinypng_queue_mode';
     const META_QUEUE_ATTEMPTS   = '_maomomo_tinypng_queue_attempts';
     const META_QUEUE_NEXT_RUN   = '_maomomo_tinypng_queue_next_run';
     const META_QUEUE_STARTED_AT = '_maomomo_tinypng_queue_started_at';
+    const META_QUEUE_WORKER_STARTED_AT = '_maomomo_tinypng_queue_worker_started_at';
     const META_QUEUE_UPDATED_AT = '_maomomo_tinypng_queue_updated_at';
     const META_QUEUE_DONE_AT    = '_maomomo_tinypng_queue_done_at';
     const META_QUEUE_LAST_ERROR = '_maomomo_tinypng_queue_last_error';
@@ -68,8 +69,6 @@ final class MaoMoMo_TinyPNG_Media {
         add_action( 'admin_notices', array( $this, 'render_admin_notice' ) );
         add_action( 'http_api_curl', array( $this, 'apply_tinypng_proxy' ), 10, 3 );
         add_action( self::QUEUE_HOOK, array( $this, 'process_queue' ) );
-        add_action( 'wp_ajax_' . self::QUEUE_WORKER_ACTION, array( $this, 'handle_queue_worker_request' ) );
-        add_action( 'wp_ajax_nopriv_' . self::QUEUE_WORKER_ACTION, array( $this, 'handle_queue_worker_request' ) );
         add_action( 'init', array( $this, 'maybe_schedule_queue_event' ), 20 );
 
         add_filter( 'wp_generate_attachment_metadata', array( $this, 'auto_process_uploaded_attachment' ), 20, 2 );
@@ -84,6 +83,7 @@ final class MaoMoMo_TinyPNG_Media {
         if ( defined( 'WP_CLI' ) && WP_CLI ) {
             WP_CLI::add_command( 'maomomo-tinypng', array( $this, 'cli_command' ) );
             WP_CLI::add_command( 'maomomo-tinypng-fix-scaled', array( $this, 'cli_fix_scaled_originals_command' ) );
+            WP_CLI::add_command( 'maomomo-tinypng-worker', array( $this, 'cli_queue_worker_command' ) );
         }
     }
 
@@ -254,7 +254,10 @@ final class MaoMoMo_TinyPNG_Media {
                     </tr>
                 </tbody>
             </table>
-            <p class="description">队列按附件级 3 Worker 并发处理，同一附件的原图和缩略图仍会依次处理。如果站点访问量很低，WP-Cron 可能延迟触发；生产环境建议用系统 cron 定时访问 <code>wp-cron.php</code> 或执行 WP-CLI cron。</p>
+            <p class="description">队列使用 3 个独立 WP-CLI Worker 并发处理，同一附件的原图和缩略图仍会依次处理。请在服务器中配置下方 3 条系统 Cron；WP-Cron 只负责队列维护，不会处理图片。</p>
+            <pre style="max-width: 100%; overflow: auto; padding: 12px; background: #f6f7f7;"><code>* * * * * flock -n /tmp/maomomo-worker-1.lock php /网站目录/wp-cli.phar --path=/网站目录 maomomo-tinypng-worker --slot=1 --time-limit=50 &gt;/dev/null 2&gt;&amp;1
+* * * * * flock -n /tmp/maomomo-worker-2.lock php /网站目录/wp-cli.phar --path=/网站目录 maomomo-tinypng-worker --slot=2 --time-limit=50 &gt;/dev/null 2&gt;&amp;1
+* * * * * flock -n /tmp/maomomo-worker-3.lock php /网站目录/wp-cli.phar --path=/网站目录 maomomo-tinypng-worker --slot=3 --time-limit=50 &gt;/dev/null 2&gt;&amp;1</code></pre>
 
             <form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" style="margin-top: 12px;">
                 <?php wp_nonce_field( 'maomomo_tinypng_fix_webp_paths' ); ?>
@@ -564,78 +567,95 @@ final class MaoMoMo_TinyPNG_Media {
 
     public function process_queue() {
         if ( ! $this->acquire_queue_dispatch_lock() ) {
-            $this->schedule_queue_event( 15 );
-            return;
-        }
-
-        try {
-            @set_time_limit( 0 );
-            $this->fail_non_retryable_pending_queue_items();
-            $this->recover_stale_queue_items();
-
-            $running   = $this->count_queue_status( 'running' );
-            $available = max( 0, self::QUEUE_WORKERS - $running );
-            $ids       = $available > 0 ? $this->get_due_queue_attachment_ids( $available ) : array();
-
-            foreach ( $ids as $attachment_id ) {
-                $claim = $this->claim_queue_item( (int) $attachment_id );
-                if ( ! $claim ) {
-                    continue;
-                }
-
-                if ( ! $this->dispatch_queue_worker( (int) $attachment_id, $claim ) ) {
-                    // 非阻塞请求的失败状态存在不确定性，保留领取状态，交给超时回收避免重复处理。
-                    update_post_meta( (int) $attachment_id, self::META_QUEUE_LAST_ERROR, '无法确认后台 Worker 是否成功启动，将在超时后自动检查并重新排队。' );
-                }
-            }
-        } finally {
-            $this->release_queue_dispatch_lock();
-        }
-
-        if ( $this->has_due_queue_items() ) {
-            $this->schedule_queue_event( 15 );
-            return;
-        }
-
-        if ( $this->count_queue_status( 'running' ) > 0 ) {
-            // 保留看门狗事件；即使非阻塞回环请求静默失败，也能回收超时 Worker。
             $this->schedule_queue_event( MINUTE_IN_SECONDS );
             return;
         }
 
-        $next_delay = $this->get_next_queue_delay();
-        if ( $next_delay > 0 ) {
-            $this->schedule_queue_event( $next_delay );
+        try {
+            $this->fail_non_retryable_pending_queue_items();
+            $this->recover_unstarted_queue_items();
+            $this->recover_stale_queue_items();
+        } finally {
+            $this->release_queue_dispatch_lock();
+        }
+
+        if ( $this->count_queue_status( 'running' ) > 0 ) {
+            $this->schedule_queue_event( MINUTE_IN_SECONDS );
         }
     }
 
-    public function handle_queue_worker_request() {
-        $attachment_id = isset( $_POST['attachment_id'] ) ? absint( $_POST['attachment_id'] ) : 0;
-        $claim         = isset( $_POST['claim'] ) ? sanitize_text_field( wp_unslash( $_POST['claim'] ) ) : '';
-        $issued_at     = isset( $_POST['issued_at'] ) ? absint( $_POST['issued_at'] ) : 0;
-        $signature     = isset( $_POST['signature'] ) ? sanitize_text_field( wp_unslash( $_POST['signature'] ) ) : '';
+    /**
+     * 处理 TinyPNG 后台队列。
+     *
+     * ## OPTIONS
+     *
+     * [--slot=<slot>]
+     * : Worker 槽位，必须是 1、2 或 3。默认 1。
+     *
+     * [--time-limit=<seconds>]
+     * : 本轮领取新任务的最长时间。默认 50 秒；正在处理的单个附件不会被中断。
+     *
+     * [--max-jobs=<count>]
+     * : 本轮最多处理的附件数量。默认 10。
+     *
+     * @param array $args 位置参数。
+     * @param array $assoc_args 命名参数。
+     * @return void
+     */
+    public function cli_queue_worker_command( $args, $assoc_args ) {
+        $slot       = isset( $assoc_args['slot'] ) ? absint( $assoc_args['slot'] ) : 1;
+        $time_limit = isset( $assoc_args['time-limit'] ) ? absint( $assoc_args['time-limit'] ) : 50;
+        $max_jobs   = isset( $assoc_args['max-jobs'] ) ? absint( $assoc_args['max-jobs'] ) : 10;
 
-        if ( ! $this->verify_worker_signature( $attachment_id, $claim, $issued_at, $signature ) ) {
-            wp_send_json_error( array( 'message' => 'Worker 请求签名无效或已过期。' ), 403 );
+        if ( $slot < 1 || $slot > self::QUEUE_WORKERS ) {
+            WP_CLI::error( 'Worker 槽位必须是 1、2 或 3。' );
         }
 
-        ignore_user_abort( true );
+        $time_limit = min( 3600, max( 10, $time_limit ) );
+        $max_jobs   = min( 100, max( 1, $max_jobs ) );
+
+        if ( ! $this->acquire_queue_worker_slot_lock( $slot ) ) {
+            WP_CLI::log( 'Worker ' . $slot . ' 已在运行，本次跳过。' );
+            return;
+        }
+
+        $started_at = microtime( true );
+        $processed  = 0;
+        $claim_miss = 0;
+
         @set_time_limit( 0 );
 
-        if ( ! $this->process_queue_item( $attachment_id, $claim ) ) {
-            wp_send_json_error( array( 'message' => '任务已被处理、重新排队或领取凭据无效。' ), 409 );
-        }
+        try {
+            $this->fail_non_retryable_pending_queue_items();
+            $this->recover_unstarted_queue_items();
+            $this->recover_stale_queue_items();
 
-        if ( $this->has_due_queue_items() ) {
-            $this->schedule_queue_event( 1 );
-        } else {
-            $next_delay = $this->get_next_queue_delay();
-            if ( $next_delay > 0 ) {
-                $this->schedule_queue_event( $next_delay );
+            while ( $processed < $max_jobs && microtime( true ) - $started_at < $time_limit ) {
+                $ids = $this->get_due_queue_attachment_ids( 1 );
+                if ( empty( $ids ) ) {
+                    break;
+                }
+
+                $attachment_id = (int) $ids[0];
+                $claim         = $this->claim_queue_item( $attachment_id );
+                if ( ! $claim ) {
+                    $claim_miss++;
+                    if ( $claim_miss >= 5 ) {
+                        break;
+                    }
+                    continue;
+                }
+
+                $claim_miss = 0;
+                WP_CLI::log( 'Worker ' . $slot . ' 正在处理附件 #' . $attachment_id . '。' );
+                $this->process_queue_item( $attachment_id, $claim );
+                $processed++;
             }
+        } finally {
+            $this->release_queue_worker_slot_lock( $slot );
         }
 
-        wp_send_json_success( array( 'attachment_id' => $attachment_id ) );
+        WP_CLI::success( 'Worker ' . $slot . ' 本次处理 ' . $processed . ' 个附件。' );
     }
 
     private function acquire_queue_dispatch_lock() {
@@ -656,6 +676,26 @@ final class MaoMoMo_TinyPNG_Media {
 
     private function release_queue_dispatch_lock() {
         delete_option( self::QUEUE_LOCK );
+    }
+
+    private function acquire_queue_worker_slot_lock( $slot ) {
+        global $wpdb;
+
+        $lock_name = $this->queue_worker_slot_lock_name( $slot );
+        return 1 === (int) $wpdb->get_var( $wpdb->prepare( 'SELECT GET_LOCK(%s, %d)', $lock_name, 0 ) );
+    }
+
+    private function release_queue_worker_slot_lock( $slot ) {
+        global $wpdb;
+
+        $lock_name = $this->queue_worker_slot_lock_name( $slot );
+        $wpdb->get_var( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', $lock_name ) );
+    }
+
+    private function queue_worker_slot_lock_name( $slot ) {
+        global $wpdb;
+
+        return 'maomomo_tinypng_worker_' . substr( md5( $wpdb->posts ), 0, 12 ) . '_' . absint( $slot );
     }
 
     private function acquire_queue_item_lock( $attachment_id ) {
@@ -723,6 +763,7 @@ final class MaoMoMo_TinyPNG_Media {
             update_post_meta( $attachment_id, self::META_QUEUE_STARTED_AT, $now );
             update_post_meta( $attachment_id, self::META_QUEUE_UPDATED_AT, $now );
             update_post_meta( $attachment_id, self::META_QUEUE_NEXT_RUN, 0 );
+            delete_post_meta( $attachment_id, self::META_QUEUE_WORKER_STARTED_AT );
 
             if ( ! $this->owns_queue_claim( $attachment_id, $claim ) ) {
                 update_post_meta( $attachment_id, self::META_QUEUE_NEXT_RUN, $now + 15 );
@@ -745,44 +786,6 @@ final class MaoMoMo_TinyPNG_Media {
             && hash_equals( (string) get_post_meta( $attachment_id, self::META_QUEUE_CLAIM, true ), (string) $claim );
     }
 
-    private function dispatch_queue_worker( $attachment_id, $claim ) {
-        $issued_at = time();
-        $response  = wp_remote_post(
-            admin_url( 'admin-ajax.php' ),
-            array(
-                'timeout'   => 0.01,
-                'blocking'  => false,
-                'sslverify' => apply_filters( 'https_local_ssl_verify', false ),
-                'body'      => array(
-                    'action'        => self::QUEUE_WORKER_ACTION,
-                    'attachment_id' => (int) $attachment_id,
-                    'claim'         => $claim,
-                    'issued_at'     => $issued_at,
-                    'signature'     => $this->worker_signature( $attachment_id, $claim, $issued_at ),
-                ),
-            )
-        );
-
-        return ! is_wp_error( $response );
-    }
-
-    private function worker_signature( $attachment_id, $claim, $issued_at ) {
-        $payload = absint( $attachment_id ) . '|' . (string) $claim . '|' . absint( $issued_at );
-        return hash_hmac( 'sha256', $payload, wp_salt( 'nonce' ) );
-    }
-
-    private function verify_worker_signature( $attachment_id, $claim, $issued_at, $signature ) {
-        if ( ! $attachment_id || '' === $claim || ! $issued_at || '' === $signature ) {
-            return false;
-        }
-
-        if ( abs( time() - $issued_at ) > 5 * MINUTE_IN_SECONDS ) {
-            return false;
-        }
-
-        return hash_equals( $this->worker_signature( $attachment_id, $claim, $issued_at ), $signature );
-    }
-
     public function maybe_schedule_queue_event() {
         if ( wp_next_scheduled( self::QUEUE_HOOK ) ) {
             return;
@@ -794,7 +797,7 @@ final class MaoMoMo_TinyPNG_Media {
 
         set_transient( self::QUEUE_SCHEDULER_LOCK, (string) time(), MINUTE_IN_SECONDS );
 
-        if ( $this->has_due_queue_items() || $this->has_stale_running_queue_items() ) {
+        if ( $this->has_unstarted_queue_items() || $this->has_stale_running_queue_items() ) {
             $this->schedule_queue_event( 1 );
             return;
         }
@@ -804,10 +807,6 @@ final class MaoMoMo_TinyPNG_Media {
             return;
         }
 
-        $next_delay = $this->get_next_queue_delay();
-        if ( $next_delay > 0 ) {
-            $this->schedule_queue_event( $next_delay );
-        }
     }
 
     public function handle_single_action() {
@@ -1583,6 +1582,7 @@ final class MaoMoMo_TinyPNG_Media {
             update_post_meta( $attachment_id, self::META_QUEUE_UPDATED_AT, $now );
             delete_post_meta( $attachment_id, self::META_QUEUE_DONE_AT );
             delete_post_meta( $attachment_id, self::META_QUEUE_CLAIM );
+            delete_post_meta( $attachment_id, self::META_QUEUE_WORKER_STARTED_AT );
 
             update_post_meta( $attachment_id, self::META_QUEUE_ATTEMPTS, 0 );
             update_post_meta( $attachment_id, self::META_QUEUE_LAST_ERROR, '' );
@@ -1603,6 +1603,8 @@ final class MaoMoMo_TinyPNG_Media {
         if ( ! $attachment_id || ! $this->owns_queue_claim( $attachment_id, $claim ) ) {
             return false;
         }
+
+        update_post_meta( $attachment_id, self::META_QUEUE_WORKER_STARTED_AT, time() );
 
         $mode = sanitize_key( (string) get_post_meta( $attachment_id, self::META_QUEUE_MODE, true ) );
         if ( ! in_array( $mode, array( 'compress', 'webp', 'both' ), true ) ) {
@@ -1648,6 +1650,7 @@ final class MaoMoMo_TinyPNG_Media {
             $now = time();
             update_post_meta( $attachment_id, self::META_QUEUE_SUMMARY, $summary );
             update_post_meta( $attachment_id, self::META_QUEUE_UPDATED_AT, $now );
+            delete_post_meta( $attachment_id, self::META_QUEUE_WORKER_STARTED_AT );
 
             if ( ! $failed ) {
                 $queued_mode = sanitize_key( (string) get_post_meta( $attachment_id, self::META_QUEUE_MODE, true ) );
@@ -1722,11 +1725,65 @@ final class MaoMoMo_TinyPNG_Media {
         return array_map( 'absint', $query->posts );
     }
 
-    private function has_due_queue_items() {
-        return ! empty( $this->get_due_queue_attachment_ids( 1 ) );
+    private function recover_unstarted_queue_items() {
+        $unstarted_before = time() - self::QUEUE_WORKER_START_GRACE;
+        $query = new WP_Query(
+            array(
+                'post_type'      => 'attachment',
+                'post_status'    => 'inherit',
+                'post_mime_type' => 'image',
+                'posts_per_page' => 20,
+                'fields'         => 'ids',
+                'meta_query'     => array(
+                    array(
+                        'key'   => self::META_QUEUE_STATUS,
+                        'value' => 'running',
+                    ),
+                    array(
+                        'key'     => self::META_QUEUE_STARTED_AT,
+                        'value'   => $unstarted_before,
+                        'compare' => '<=',
+                        'type'    => 'NUMERIC',
+                    ),
+                    array(
+                        'key'     => self::META_QUEUE_WORKER_STARTED_AT,
+                        'compare' => 'NOT EXISTS',
+                    ),
+                ),
+                'no_found_rows'  => true,
+            )
+        );
+
+        foreach ( $query->posts as $attachment_id ) {
+            $attachment_id = (int) $attachment_id;
+            if ( ! $this->acquire_queue_item_lock( $attachment_id ) ) {
+                continue;
+            }
+
+            try {
+                wp_cache_delete( $attachment_id, 'post_meta' );
+                $status            = (string) get_post_meta( $attachment_id, self::META_QUEUE_STATUS, true );
+                $started_at        = (int) get_post_meta( $attachment_id, self::META_QUEUE_STARTED_AT, true );
+                $worker_started_at = (int) get_post_meta( $attachment_id, self::META_QUEUE_WORKER_STARTED_AT, true );
+
+                if ( 'running' !== $status || $started_at > $unstarted_before || $worker_started_at > 0 ) {
+                    continue;
+                }
+
+                update_post_meta( $attachment_id, self::META_QUEUE_NEXT_RUN, time() );
+                update_post_meta( $attachment_id, self::META_QUEUE_ATTEMPTS, 0 );
+                update_post_meta( $attachment_id, self::META_QUEUE_LAST_ERROR, '旧版回环 Worker 未启动，已交给系统 Cron Worker 重新处理。' );
+                update_post_meta( $attachment_id, self::META_QUEUE_UPDATED_AT, time() );
+                delete_post_meta( $attachment_id, self::META_QUEUE_CLAIM );
+                delete_post_meta( $attachment_id, self::META_QUEUE_WORKER_STARTED_AT );
+                update_post_meta( $attachment_id, self::META_QUEUE_STATUS, 'pending', 'running' );
+            } finally {
+                $this->release_queue_item_lock( $attachment_id );
+            }
+        }
     }
 
-    private function get_next_queue_delay() {
+    private function has_unstarted_queue_items() {
         $query = new WP_Query(
             array(
                 'post_type'      => 'attachment',
@@ -1734,31 +1791,27 @@ final class MaoMoMo_TinyPNG_Media {
                 'post_mime_type' => 'image',
                 'posts_per_page' => 1,
                 'fields'         => 'ids',
-                'orderby'        => 'meta_value_num',
-                'order'          => 'ASC',
-                'meta_key'       => self::META_QUEUE_NEXT_RUN,
                 'meta_query'     => array(
                     array(
                         'key'   => self::META_QUEUE_STATUS,
-                        'value' => 'pending',
+                        'value' => 'running',
                     ),
                     array(
-                        'key'     => self::META_QUEUE_NEXT_RUN,
-                        'value'   => 0,
-                        'compare' => '>',
+                        'key'     => self::META_QUEUE_STARTED_AT,
+                        'value'   => time() - self::QUEUE_WORKER_START_GRACE,
+                        'compare' => '<=',
                         'type'    => 'NUMERIC',
+                    ),
+                    array(
+                        'key'     => self::META_QUEUE_WORKER_STARTED_AT,
+                        'compare' => 'NOT EXISTS',
                     ),
                 ),
                 'no_found_rows'  => true,
             )
         );
 
-        if ( empty( $query->posts ) ) {
-            return 0;
-        }
-
-        $next_run = (int) get_post_meta( (int) $query->posts[0], self::META_QUEUE_NEXT_RUN, true );
-        return max( 15, $next_run - time() );
+        return ! empty( $query->posts );
     }
 
     private function recover_stale_queue_items() {
@@ -1804,6 +1857,7 @@ final class MaoMoMo_TinyPNG_Media {
                 update_post_meta( $attachment_id, self::META_QUEUE_LAST_ERROR, '上次后台 Worker 超时，已重新排队。' );
                 update_post_meta( $attachment_id, self::META_QUEUE_UPDATED_AT, time() );
                 delete_post_meta( $attachment_id, self::META_QUEUE_CLAIM );
+                delete_post_meta( $attachment_id, self::META_QUEUE_WORKER_STARTED_AT );
                 update_post_meta( $attachment_id, self::META_QUEUE_STATUS, 'pending', 'running' );
             } finally {
                 $this->release_queue_item_lock( $attachment_id );
