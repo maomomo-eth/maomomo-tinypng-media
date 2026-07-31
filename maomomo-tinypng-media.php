@@ -3,7 +3,7 @@
  * Plugin Name: MaoMoMo TinyPNG Media
  * Plugin URI: https://www.maomomo.com
  * Description: 在媒体库中使用多个 TinyPNG API Token 轮换压缩图片，并支持转换 WebP。
- * Version: 1.6.0
+ * Version: 1.6.1
  * Author: MAOMOMO
  * Author URI: https://www.maomomo.com
  * Requires at least: 5.8
@@ -106,6 +106,7 @@ final class MaoMoMo_TinyPNG_Media {
         $tokens   = $this->get_tokens();
         $usage    = $this->get_usage();
         $queue_counts = $this->get_queue_counts();
+        $cron_config = $this->get_queue_cron_configuration();
         ?>
         <div class="wrap">
             <h1>TinyPNG 媒体压缩</h1>
@@ -162,7 +163,7 @@ final class MaoMoMo_TinyPNG_Media {
                                 <option value="webp" <?php selected( $settings['auto_mode'], 'webp' ); ?>>自动转 WebP</option>
                                 <option value="both" <?php selected( $settings['auto_mode'], 'both' ); ?>>自动压缩并转 WebP</option>
                             </select>
-                            <p class="description">启用后，新上传到媒体库的图片会在 WordPress 生成附件元数据后加入后台队列，由 WP-Cron 异步处理。</p>
+                            <p class="description">启用后，新上传到媒体库的图片会在 WordPress 生成附件元数据后加入后台队列，由系统 Cron 的 WP-CLI Worker 异步处理。</p>
                         </td>
                     </tr>
                     <tr>
@@ -255,9 +256,18 @@ final class MaoMoMo_TinyPNG_Media {
                 </tbody>
             </table>
             <p class="description">队列使用 3 个独立 WP-CLI Worker 并发处理，同一附件的原图和缩略图仍会依次处理。请在服务器中配置下方 3 条系统 Cron；WP-Cron 只负责队列维护，不会处理图片。</p>
-            <pre style="max-width: 100%; overflow: auto; padding: 12px; background: #f6f7f7;"><code>* * * * * flock -n /tmp/maomomo-worker-1.lock php /网站目录/wp-cli.phar --path=/网站目录 maomomo-tinypng-worker --slot=1 --time-limit=50 &gt;/dev/null 2&gt;&amp;1
-* * * * * flock -n /tmp/maomomo-worker-2.lock php /网站目录/wp-cli.phar --path=/网站目录 maomomo-tinypng-worker --slot=2 --time-limit=50 &gt;/dev/null 2&gt;&amp;1
-* * * * * flock -n /tmp/maomomo-worker-3.lock php /网站目录/wp-cli.phar --path=/网站目录 maomomo-tinypng-worker --slot=3 --time-limit=50 &gt;/dev/null 2&gt;&amp;1</code></pre>
+            <?php if ( empty( $cron_config['missing'] ) ) : ?>
+                <p class="description">
+                    已检测：PHP <code><?php echo esc_html( $cron_config['php_binary'] ); ?></code>；
+                    WP-CLI <code><?php echo esc_html( $cron_config['wp_cli'] ); ?></code>；
+                    WordPress <code><?php echo esc_html( $cron_config['wordpress_path'] ); ?></code>。
+                </p>
+                <pre style="max-width: 100%; overflow: auto; padding: 12px; background: #f6f7f7;"><code><?php echo esc_html( implode( "\n", $cron_config['commands'] ) ); ?></code></pre>
+            <?php else : ?>
+                <div class="notice notice-warning inline">
+                    <p>无法生成可直接使用的 Cron：未检测到 <?php echo esc_html( implode( '、', $cron_config['missing'] ) ); ?>。可在 <code>wp-config.php</code> 中定义 <code>MAOMOMO_TINYPNG_PHP_BINARY</code>、<code>MAOMOMO_TINYPNG_WP_CLI_PATH</code> 或 <code>MAOMOMO_TINYPNG_FLOCK_PATH</code> 后刷新本页。</p>
+                </div>
+            <?php endif; ?>
 
             <form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" style="margin-top: 12px;">
                 <?php wp_nonce_field( 'maomomo_tinypng_fix_webp_paths' ); ?>
@@ -2783,6 +2793,103 @@ final class MaoMoMo_TinyPNG_Media {
     private function is_supported_path( $path ) {
         $ext = strtolower( pathinfo( $path, PATHINFO_EXTENSION ) );
         return in_array( $ext, array( 'png', 'jpg', 'jpeg', 'webp', 'avif' ), true );
+    }
+
+    private function get_queue_cron_configuration() {
+        $wordpress_path = realpath( ABSPATH );
+        $php_candidates = array(
+            PHP_BINDIR . DIRECTORY_SEPARATOR . 'php',
+            dirname( PHP_BINARY ) . DIRECTORY_SEPARATOR . 'php',
+            PHP_BINARY,
+            '/usr/local/bin/php',
+            '/usr/bin/php',
+        );
+        $wp_cli_candidates = array(
+            '/usr/local/bin/wp',
+            '/usr/bin/wp',
+            ABSPATH . 'wp-cli.phar',
+        );
+        $flock_candidates = array(
+            '/usr/bin/flock',
+            '/bin/flock',
+        );
+
+        $php_binary = $this->resolve_cron_program( 'MAOMOMO_TINYPNG_PHP_BINARY', $php_candidates, true );
+        $wp_cli     = $this->resolve_cron_program( 'MAOMOMO_TINYPNG_WP_CLI_PATH', $wp_cli_candidates, false );
+        $flock      = $this->resolve_cron_program( 'MAOMOMO_TINYPNG_FLOCK_PATH', $flock_candidates, true );
+        $missing    = array();
+
+        if ( ! $php_binary ) {
+            $missing[] = 'PHP CLI';
+        }
+        if ( ! $wp_cli ) {
+            $missing[] = 'WP-CLI';
+        }
+        if ( ! $flock ) {
+            $missing[] = 'flock';
+        }
+        if ( ! $wordpress_path || ! is_dir( $wordpress_path ) ) {
+            $missing[] = 'WordPress 根目录';
+        }
+
+        $commands = array();
+        if ( empty( $missing ) ) {
+            $php_arg      = $this->shell_command_arg( $php_binary );
+            $wp_cli_arg   = $this->shell_command_arg( $wp_cli );
+            $flock_arg    = $this->shell_command_arg( $flock );
+            $wp_path_arg  = $this->shell_command_arg( $wordpress_path );
+
+            for ( $slot = 1; $slot <= self::QUEUE_WORKERS; $slot++ ) {
+                $commands[] = sprintf(
+                    '* * * * * %1$s -n /tmp/maomomo-worker-%2$d.lock %3$s %4$s --path=%5$s maomomo-tinypng-worker --slot=%2$d --time-limit=50 --max-jobs=10 >/dev/null 2>&1',
+                    $flock_arg,
+                    $slot,
+                    $php_arg,
+                    $wp_cli_arg,
+                    $wp_path_arg
+                );
+            }
+        }
+
+        return array(
+            'php_binary'    => $php_binary ? $php_binary : '',
+            'wp_cli'        => $wp_cli ? $wp_cli : '',
+            'flock'         => $flock ? $flock : '',
+            'wordpress_path' => $wordpress_path ? wp_normalize_path( $wordpress_path ) : '',
+            'commands'      => $commands,
+            'missing'       => $missing,
+        );
+    }
+
+    private function resolve_cron_program( $constant_name, $candidates, $require_executable ) {
+        if ( defined( $constant_name ) ) {
+            array_unshift( $candidates, (string) constant( $constant_name ) );
+        }
+
+        foreach ( array_unique( array_filter( $candidates ) ) as $candidate ) {
+            $resolved = realpath( $candidate );
+            if ( ! $resolved || ! is_file( $resolved ) || ! is_readable( $resolved ) ) {
+                continue;
+            }
+
+            if ( $require_executable && ! is_executable( $resolved ) ) {
+                continue;
+            }
+
+            // 保留软链接入口名称，例如 BusyBox 的 /usr/bin/flock 不能替换成 /bin/busybox。
+            return wp_normalize_path( $candidate );
+        }
+
+        return '';
+    }
+
+    private function shell_command_arg( $value ) {
+        $value = (string) $value;
+        if ( preg_match( '/\A[A-Za-z0-9_\/.:-]+\z/', $value ) ) {
+            return $value;
+        }
+
+        return escapeshellarg( $value );
     }
 
     private function get_settings() {
