@@ -2,7 +2,7 @@
 Contributors: maomomo
 Requires at least: 5.8
 Requires PHP: 7.4
-Stable tag: 1.6.1
+Stable tag: 1.6.2
 
 在 WordPress 媒体库中使用多个 TinyPNG API Token 轮换压缩图片，并支持转换 WebP。
 
@@ -36,7 +36,7 @@ Stable tag: 1.6.1
 
 == 系统 Cron 3 Worker ==
 
-插件设置页会自动检测 PHP CLI、全局 WP-CLI、`flock` 和 WordPress 根目录，并生成可直接复制的 3 条 Cron。以下为通用格式：
+插件设置页会根据 PHP 环境、常见系统路径和 WordPress 根目录生成可直接复制的 3 条 Cron。PHP-FPM 因 `open_basedir` 无法检查站点外路径时，也会生成标准路径；如服务器路径不同，可在 `wp-config.php` 中定义对应路径常量。以下为通用格式：
 
 `* * * * * flock -n /tmp/maomomo-worker-1.lock php /网站目录/wp-cli.phar --path=/网站目录 maomomo-tinypng-worker --slot=1 --time-limit=50 >/dev/null 2>&1`
 
@@ -113,6 +113,12 @@ TOKEN_2
 从 1.5.0 开始，插件支持在 WordPress 后台检查并安装 GitHub 正式 Release。1.4.0 及更早版本尚未包含更新检查器，需要先手动安装一次 1.5.0 或更高版本。
 
 == 更新日志 ==
+
+= 1.6.2 =
+
+* 修复 `open_basedir` 导致 PHP CLI、WP-CLI 和 `flock` 路径被误判为不存在的问题。
+* WordPress 根目录优先使用 `ABSPATH`，并支持通过插件的 `__DIR__` 反推。
+* PHP-FPM 无法检查系统路径时按标准位置生成 Cron，仍可通过 `wp-config.php` 路径常量覆盖。
 
 = 1.6.1 =
 

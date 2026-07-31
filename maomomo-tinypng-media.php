@@ -3,7 +3,7 @@
  * Plugin Name: MaoMoMo TinyPNG Media
  * Plugin URI: https://www.maomomo.com
  * Description: 在媒体库中使用多个 TinyPNG API Token 轮换压缩图片，并支持转换 WebP。
- * Version: 1.6.1
+ * Version: 1.6.2
  * Author: MAOMOMO
  * Author URI: https://www.maomomo.com
  * Requires at least: 5.8
@@ -258,7 +258,7 @@ final class MaoMoMo_TinyPNG_Media {
             <p class="description">队列使用 3 个独立 WP-CLI Worker 并发处理，同一附件的原图和缩略图仍会依次处理。请在服务器中配置下方 3 条系统 Cron；WP-Cron 只负责队列维护，不会处理图片。</p>
             <?php if ( empty( $cron_config['missing'] ) ) : ?>
                 <p class="description">
-                    已检测：PHP <code><?php echo esc_html( $cron_config['php_binary'] ); ?></code>；
+                    当前生成路径：PHP <code><?php echo esc_html( $cron_config['php_binary'] ); ?></code>；
                     WP-CLI <code><?php echo esc_html( $cron_config['wp_cli'] ); ?></code>；
                     WordPress <code><?php echo esc_html( $cron_config['wordpress_path'] ); ?></code>。
                 </p>
@@ -2796,7 +2796,10 @@ final class MaoMoMo_TinyPNG_Media {
     }
 
     private function get_queue_cron_configuration() {
-        $wordpress_path = realpath( ABSPATH );
+        // ABSPATH 不受 open_basedir 对站点外系统目录的限制；异常环境再从插件目录反推 WordPress 根目录。
+        $wordpress_path = defined( 'ABSPATH' ) && ABSPATH
+            ? untrailingslashit( wp_normalize_path( ABSPATH ) )
+            : untrailingslashit( wp_normalize_path( dirname( __DIR__, 3 ) ) );
         $php_candidates = array(
             PHP_BINDIR . DIRECTORY_SEPARATOR . 'php',
             dirname( PHP_BINARY ) . DIRECTORY_SEPARATOR . 'php',
@@ -2828,7 +2831,7 @@ final class MaoMoMo_TinyPNG_Media {
         if ( ! $flock ) {
             $missing[] = 'flock';
         }
-        if ( ! $wordpress_path || ! is_dir( $wordpress_path ) ) {
+        if ( ! $wordpress_path ) {
             $missing[] = 'WordPress 根目录';
         }
 
@@ -2863,16 +2866,19 @@ final class MaoMoMo_TinyPNG_Media {
 
     private function resolve_cron_program( $constant_name, $candidates, $require_executable ) {
         if ( defined( $constant_name ) ) {
-            array_unshift( $candidates, (string) constant( $constant_name ) );
+            $override = trim( (string) constant( $constant_name ) );
+            if ( '' !== $override ) {
+                return wp_normalize_path( $override );
+            }
         }
 
-        foreach ( array_unique( array_filter( $candidates ) ) as $candidate ) {
-            $resolved = realpath( $candidate );
-            if ( ! $resolved || ! is_file( $resolved ) || ! is_readable( $resolved ) ) {
+        $candidates = array_values( array_unique( array_filter( array_map( 'strval', $candidates ) ) ) );
+        foreach ( $candidates as $candidate ) {
+            if ( ! @is_file( $candidate ) || ! @is_readable( $candidate ) ) {
                 continue;
             }
 
-            if ( $require_executable && ! is_executable( $resolved ) ) {
+            if ( $require_executable && ! @is_executable( $candidate ) ) {
                 continue;
             }
 
@@ -2880,7 +2886,8 @@ final class MaoMoMo_TinyPNG_Media {
             return wp_normalize_path( $candidate );
         }
 
-        return '';
+        // 宝塔等环境常用 open_basedir 禁止 PHP-FPM 检查站点外路径，此时使用首选标准路径生成命令。
+        return ! empty( $candidates ) ? wp_normalize_path( $candidates[0] ) : '';
     }
 
     private function shell_command_arg( $value ) {
