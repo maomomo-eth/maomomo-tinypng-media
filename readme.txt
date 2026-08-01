@@ -2,7 +2,7 @@
 Contributors: maomomo
 Requires at least: 5.8
 Requires PHP: 7.4
-Stable tag: 1.6.2
+Stable tag: 1.6.3
 
 在 WordPress 媒体库中使用多个 TinyPNG API Token 轮换压缩图片，并支持转换 WebP。
 
@@ -36,13 +36,13 @@ Stable tag: 1.6.2
 
 == 系统 Cron 3 Worker ==
 
-插件设置页会根据 PHP 环境、常见系统路径和 WordPress 根目录生成可直接复制的 3 条 Cron。PHP-FPM 因 `open_basedir` 无法检查站点外路径时，也会生成标准路径；如服务器路径不同，可在 `wp-config.php` 中定义对应路径常量。以下为通用格式：
+插件设置页会根据 PHP 环境、常见系统路径和 WordPress 根目录生成可直接复制的 3 条 Cron。生成时会自动加入 `--skip-themes`，并通过 `--skip-plugins` 排除本插件之外的其他已启用插件，降低每个 Worker 加载 WordPress 的资源消耗。PHP-FPM 因 `open_basedir` 无法检查站点外路径时，也会生成标准路径；如服务器路径不同，可在 `wp-config.php` 中定义对应路径常量。以下为通用格式：
 
-`* * * * * flock -n /tmp/maomomo-worker-1.lock php /网站目录/wp-cli.phar --path=/网站目录 maomomo-tinypng-worker --slot=1 --time-limit=50 >/dev/null 2>&1`
+`* * * * * flock -n /tmp/maomomo-worker-1.lock php /网站目录/wp-cli.phar --path=/网站目录 --skip-plugins=其他插件slug --skip-themes maomomo-tinypng-worker --slot=1 --time-limit=50 --max-jobs=10 >/dev/null 2>&1`
 
-`* * * * * flock -n /tmp/maomomo-worker-2.lock php /网站目录/wp-cli.phar --path=/网站目录 maomomo-tinypng-worker --slot=2 --time-limit=50 >/dev/null 2>&1`
+`* * * * * flock -n /tmp/maomomo-worker-2.lock php /网站目录/wp-cli.phar --path=/网站目录 --skip-plugins=其他插件slug --skip-themes maomomo-tinypng-worker --slot=2 --time-limit=50 --max-jobs=10 >/dev/null 2>&1`
 
-`* * * * * flock -n /tmp/maomomo-worker-3.lock php /网站目录/wp-cli.phar --path=/网站目录 maomomo-tinypng-worker --slot=3 --time-limit=50 >/dev/null 2>&1`
+`* * * * * flock -n /tmp/maomomo-worker-3.lock php /网站目录/wp-cli.phar --path=/网站目录 --skip-plugins=其他插件slug --skip-themes maomomo-tinypng-worker --slot=3 --time-limit=50 --max-jobs=10 >/dev/null 2>&1`
 
 每个槽位同时只允许运行一个进程；即使上一分钟的任务尚未结束，也不会重复启动同槽位 Worker。插件内部还有 MySQL 槽位锁和附件领取锁，防止同一附件被重复处理。
 
@@ -113,6 +113,12 @@ TOKEN_2
 从 1.5.0 开始，插件支持在 WordPress 后台检查并安装 GitHub 正式 Release。1.4.0 及更早版本尚未包含更新检查器，需要先手动安装一次 1.5.0 或更高版本。
 
 == 更新日志 ==
+
+= 1.6.3 =
+
+* 后台生成的 Cron 自动加入 `--skip-themes`。
+* 自动读取当前站点及多站点网络启用插件，通过 `--skip-plugins` 排除本插件之外的其他插件。
+* 设置页显示被排除的插件数量和 slug，便于直接核对 Cron。
 
 = 1.6.2 =
 

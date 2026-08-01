@@ -3,7 +3,7 @@
  * Plugin Name: MaoMoMo TinyPNG Media
  * Plugin URI: https://www.maomomo.com
  * Description: 在媒体库中使用多个 TinyPNG API Token 轮换压缩图片，并支持转换 WebP。
- * Version: 1.6.2
+ * Version: 1.6.3
  * Author: MAOMOMO
  * Author URI: https://www.maomomo.com
  * Requires at least: 5.8
@@ -261,6 +261,10 @@ final class MaoMoMo_TinyPNG_Media {
                     当前生成路径：PHP <code><?php echo esc_html( $cron_config['php_binary'] ); ?></code>；
                     WP-CLI <code><?php echo esc_html( $cron_config['wp_cli'] ); ?></code>；
                     WordPress <code><?php echo esc_html( $cron_config['wordpress_path'] ); ?></code>。
+                </p>
+                <p class="description">
+                    性能优化：已加入 <code>--skip-themes</code>
+                    <?php if ( ! empty( $cron_config['skip_plugins'] ) ) : ?>，并排除其他 <?php echo esc_html( (string) count( $cron_config['skip_plugins'] ) ); ?> 个已启用插件：<code><?php echo esc_html( implode( ',', $cron_config['skip_plugins'] ) ); ?></code><?php else : ?>；当前没有需要排除的其他已启用插件<?php endif; ?>。
                 </p>
                 <pre style="max-width: 100%; overflow: auto; padding: 12px; background: #f6f7f7;"><code><?php echo esc_html( implode( "\n", $cron_config['commands'] ) ); ?></code></pre>
             <?php else : ?>
@@ -2817,10 +2821,11 @@ final class MaoMoMo_TinyPNG_Media {
             '/bin/flock',
         );
 
-        $php_binary = $this->resolve_cron_program( 'MAOMOMO_TINYPNG_PHP_BINARY', $php_candidates, true );
-        $wp_cli     = $this->resolve_cron_program( 'MAOMOMO_TINYPNG_WP_CLI_PATH', $wp_cli_candidates, false );
-        $flock      = $this->resolve_cron_program( 'MAOMOMO_TINYPNG_FLOCK_PATH', $flock_candidates, true );
-        $missing    = array();
+        $php_binary   = $this->resolve_cron_program( 'MAOMOMO_TINYPNG_PHP_BINARY', $php_candidates, true );
+        $wp_cli       = $this->resolve_cron_program( 'MAOMOMO_TINYPNG_WP_CLI_PATH', $wp_cli_candidates, false );
+        $flock        = $this->resolve_cron_program( 'MAOMOMO_TINYPNG_FLOCK_PATH', $flock_candidates, true );
+        $skip_plugins = $this->get_cron_skip_plugin_slugs();
+        $missing      = array();
 
         if ( ! $php_binary ) {
             $missing[] = 'PHP CLI';
@@ -2841,15 +2846,22 @@ final class MaoMoMo_TinyPNG_Media {
             $wp_cli_arg   = $this->shell_command_arg( $wp_cli );
             $flock_arg    = $this->shell_command_arg( $flock );
             $wp_path_arg  = $this->shell_command_arg( $wordpress_path );
+            $performance_args = '--skip-themes';
+
+            if ( ! empty( $skip_plugins ) ) {
+                // 插件 slug 已经过严格字符校验，可直接组成 WP-CLI 的逗号分隔参数。
+                $performance_args = '--skip-plugins=' . implode( ',', $skip_plugins ) . ' ' . $performance_args;
+            }
 
             for ( $slot = 1; $slot <= self::QUEUE_WORKERS; $slot++ ) {
                 $commands[] = sprintf(
-                    '* * * * * %1$s -n /tmp/maomomo-worker-%2$d.lock %3$s %4$s --path=%5$s maomomo-tinypng-worker --slot=%2$d --time-limit=50 --max-jobs=10 >/dev/null 2>&1',
+                    '* * * * * %1$s -n /tmp/maomomo-worker-%2$d.lock %3$s %4$s --path=%5$s %6$s maomomo-tinypng-worker --slot=%2$d --time-limit=50 --max-jobs=10 >/dev/null 2>&1',
                     $flock_arg,
                     $slot,
                     $php_arg,
                     $wp_cli_arg,
-                    $wp_path_arg
+                    $wp_path_arg,
+                    $performance_args
                 );
             }
         }
@@ -2859,9 +2871,50 @@ final class MaoMoMo_TinyPNG_Media {
             'wp_cli'        => $wp_cli ? $wp_cli : '',
             'flock'         => $flock ? $flock : '',
             'wordpress_path' => $wordpress_path ? wp_normalize_path( $wordpress_path ) : '',
+            'skip_plugins'   => $skip_plugins,
             'commands'      => $commands,
             'missing'       => $missing,
         );
+    }
+
+    private function get_cron_skip_plugin_slugs() {
+        $plugin_files = get_option( 'active_plugins', array() );
+        $plugin_files = is_array( $plugin_files ) ? $plugin_files : array();
+
+        if ( is_multisite() ) {
+            $network_plugins = get_site_option( 'active_sitewide_plugins', array() );
+            if ( is_array( $network_plugins ) ) {
+                $plugin_files = array_merge( $plugin_files, array_keys( $network_plugins ) );
+            }
+        }
+
+        $current_plugin = wp_normalize_path( plugin_basename( __FILE__ ) );
+        $current_parts  = explode( '/', $current_plugin );
+        $current_slug   = count( $current_parts ) > 1
+            ? $current_parts[0]
+            : pathinfo( $current_parts[0], PATHINFO_FILENAME );
+        $slugs = array();
+
+        foreach ( array_unique( $plugin_files ) as $plugin_file ) {
+            $plugin_file = ltrim( wp_normalize_path( (string) $plugin_file ), '/' );
+            if ( '' === $plugin_file || $plugin_file === $current_plugin ) {
+                continue;
+            }
+
+            $parts = explode( '/', $plugin_file );
+            $slug  = count( $parts ) > 1 ? $parts[0] : pathinfo( $parts[0], PATHINFO_FILENAME );
+
+            // 防止同一插件目录中的其他入口文件被加入跳过列表，同时限制为 WP-CLI 支持的安全 slug。
+            if ( '' === $slug || $slug === $current_slug || ! preg_match( '/\A[A-Za-z0-9_.-]+\z/', $slug ) ) {
+                continue;
+            }
+
+            $slugs[] = $slug;
+        }
+
+        $slugs = array_values( array_unique( $slugs ) );
+        natcasesort( $slugs );
+        return array_values( $slugs );
     }
 
     private function resolve_cron_program( $constant_name, $candidates, $require_executable ) {
