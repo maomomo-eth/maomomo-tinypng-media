@@ -3,7 +3,7 @@
  * Plugin Name: MaoMoMo TinyPNG Media
  * Plugin URI: https://www.maomomo.com
  * Description: 在媒体库中使用多个 TinyPNG API Token 轮换压缩图片，并支持转换 WebP。
- * Version: 1.6.3
+ * Version: 1.7.0
  * Author: MAOMOMO
  * Author URI: https://www.maomomo.com
  * Requires at least: 5.8
@@ -18,6 +18,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 require_once __DIR__ . '/lib/plugin-update-checker/plugin-update-checker.php';
 require_once __DIR__ . '/includes/class-maomomo-github-updater.php';
+require_once __DIR__ . '/includes/class-maomomo-go-worker-client.php';
 
 MaoMoMo_GitHub_Updater::init( __FILE__ );
 
@@ -51,6 +52,7 @@ final class MaoMoMo_TinyPNG_Media {
 
     private $auto_processing = false;
     private $queue_processing_attachment_id = 0;
+    private $go_dispatch_requested = false;
 
     public static function instance() {
         if ( null === self::$instance ) {
@@ -70,6 +72,8 @@ final class MaoMoMo_TinyPNG_Media {
         add_action( 'http_api_curl', array( $this, 'apply_tinypng_proxy' ), 10, 3 );
         add_action( self::QUEUE_HOOK, array( $this, 'process_queue' ) );
         add_action( 'init', array( $this, 'maybe_schedule_queue_event' ), 20 );
+        add_action( 'shutdown', array( $this, 'dispatch_go_worker_on_shutdown' ), 20 );
+        add_action( 'rest_api_init', array( $this, 'register_go_worker_routes' ) );
 
         add_filter( 'wp_generate_attachment_metadata', array( $this, 'auto_process_uploaded_attachment' ), 20, 2 );
         add_filter( 'media_row_actions', array( $this, 'add_media_row_actions' ), 10, 3 );
@@ -107,6 +111,11 @@ final class MaoMoMo_TinyPNG_Media {
         $usage    = $this->get_usage();
         $queue_counts = $this->get_queue_counts();
         $cron_config = $this->get_queue_cron_configuration();
+        $go_config = $this->get_go_worker_configuration();
+        $go_install = $this->get_go_worker_install_configuration();
+        $go_health = 'go' === $settings['worker_engine']
+            ? $this->get_go_worker_client()->health()
+            : null;
         ?>
         <div class="wrap">
             <h1>TinyPNG 媒体压缩</h1>
@@ -163,7 +172,45 @@ final class MaoMoMo_TinyPNG_Media {
                                 <option value="webp" <?php selected( $settings['auto_mode'], 'webp' ); ?>>自动转 WebP</option>
                                 <option value="both" <?php selected( $settings['auto_mode'], 'both' ); ?>>自动压缩并转 WebP</option>
                             </select>
-                            <p class="description">启用后，新上传到媒体库的图片会在 WordPress 生成附件元数据后加入后台队列，由系统 Cron 的 WP-CLI Worker 异步处理。</p>
+                            <p class="description">启用后，新上传到媒体库的图片会在 WordPress 生成附件元数据后加入后台队列，由下方选择的处理引擎异步执行。</p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row"><label for="maomomo-tinypng-worker-engine">后台处理引擎</label></th>
+                        <td>
+                            <select id="maomomo-tinypng-worker-engine" name="worker_engine">
+                                <option value="cron" <?php selected( $settings['worker_engine'], 'cron' ); ?>>WP-CLI 系统 Cron</option>
+                                <option value="go" <?php selected( $settings['worker_engine'], 'go' ); ?>>Go 常驻服务（附件级 3 Worker）</option>
+                            </select>
+                            <p class="description">Go 模式不会每分钟空启动多套 WordPress；Go 负责 TinyPNG 请求和文件写入，WordPress 只负责入队及附件 metadata 写回。</p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row"><label for="maomomo-tinypng-go-worker-url">Go Worker 地址</label></th>
+                        <td>
+                            <input
+                                id="maomomo-tinypng-go-worker-url"
+                                type="url"
+                                class="regular-text code"
+                                name="go_worker_url"
+                                value="<?php echo esc_attr( $go_config['url'] ); ?>"
+                                placeholder="http://127.0.0.1:17863"
+                            >
+                            <p class="description">只允许 <code>127.0.0.1</code>、<code>localhost</code> 或 <code>::1</code>，不会向公网发送 Token 或文件路径。</p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row"><label for="maomomo-tinypng-go-worker-secret">Go Worker 共享密钥</label></th>
+                        <td>
+                            <input
+                                id="maomomo-tinypng-go-worker-secret"
+                                type="text"
+                                class="large-text code"
+                                name="go_worker_secret"
+                                value="<?php echo esc_attr( $go_config['secret'] ); ?>"
+                                autocomplete="off"
+                            >
+                            <p class="description">至少 32 个字符，用于 HMAC-SHA256 请求签名；选择 Go 模式后留空保存会自动生成。</p>
                         </td>
                     </tr>
                     <tr>
@@ -235,6 +282,21 @@ final class MaoMoMo_TinyPNG_Media {
             </form>
 
             <h2>后台队列</h2>
+            <?php if ( 'go' === $settings['worker_engine'] ) : ?>
+                <?php if ( is_wp_error( $go_health ) ) : ?>
+                    <div class="notice notice-warning inline"><p>Go Worker 未连接：<?php echo esc_html( $go_health->get_error_message() ); ?></p></div>
+                <?php else : ?>
+                    <div class="notice notice-success inline"><p>Go Worker 已连接：版本 <code><?php echo esc_html( isset( $go_health['version'] ) ? $go_health['version'] : '未知' ); ?></code>，附件级并发 <code><?php echo esc_html( isset( $go_health['workers'] ) ? (string) $go_health['workers'] : '未知' ); ?></code>。</p></div>
+                <?php endif; ?>
+                <details style="max-width: 1000px; margin: 12px 0;">
+                    <summary><strong>Go Worker systemd 部署命令</strong></summary>
+                    <p class="description">先升级到包含当前架构二进制的正式 Release，再以 root 执行。以下路径和共享密钥已按当前站点生成。</p>
+                    <pre style="overflow: auto; padding: 12px; background: #f6f7f7;"><code><?php echo esc_html( $go_install['install_commands'] ); ?></code></pre>
+                    <p><code>/etc/maomomo-tinypng-worker.env</code> 内容：</p>
+                    <pre style="overflow: auto; padding: 12px; background: #f6f7f7;"><code><?php echo esc_html( $go_install['env_content'] ); ?></code></pre>
+                    <pre style="overflow: auto; padding: 12px; background: #f6f7f7;"><code><?php echo esc_html( $go_install['start_commands'] ); ?></code></pre>
+                </details>
+            <?php endif; ?>
             <table class="widefat striped" style="max-width: 620px;">
                 <tbody>
                     <tr>
@@ -255,7 +317,11 @@ final class MaoMoMo_TinyPNG_Media {
                     </tr>
                 </tbody>
             </table>
-            <p class="description">队列使用 3 个独立 WP-CLI Worker 并发处理，同一附件的原图和缩略图仍会依次处理。请在服务器中配置下方 3 条系统 Cron；WP-Cron 只负责队列维护，不会处理图片。</p>
+            <?php if ( 'go' === $settings['worker_engine'] ) : ?>
+                <p class="description">Go 常驻服务使用 3 个轻量 Worker 做附件级并发。同一附件的原图和缩略图仍会依次处理；请停用旧的 3 条图片 Worker Cron，WP-Cron 只负责提交任务和写回结果。</p>
+            <?php else : ?>
+                <p class="description">队列使用 3 个独立 WP-CLI Worker 并发处理，同一附件的原图和缩略图仍会依次处理。请在服务器中配置下方 3 条系统 Cron；WP-Cron 只负责队列维护，不会处理图片。</p>
+            <?php endif; ?>
             <?php if ( empty( $cron_config['missing'] ) ) : ?>
                 <p class="description">
                     当前生成路径：PHP <code><?php echo esc_html( $cron_config['php_binary'] ); ?></code>；
@@ -295,9 +361,18 @@ final class MaoMoMo_TinyPNG_Media {
         $timeout       = isset( $_POST['timeout'] ) ? absint( $_POST['timeout'] ) : 90;
         $proxy         = isset( $_POST['proxy'] ) ? sanitize_text_field( wp_unslash( $_POST['proxy'] ) ) : '';
         $auto_mode     = isset( $_POST['auto_mode'] ) ? sanitize_key( wp_unslash( $_POST['auto_mode'] ) ) : 'none';
+        $worker_engine = isset( $_POST['worker_engine'] ) ? sanitize_key( wp_unslash( $_POST['worker_engine'] ) ) : 'cron';
+        $go_worker_url = isset( $_POST['go_worker_url'] ) ? esc_url_raw( wp_unslash( $_POST['go_worker_url'] ) ) : 'http://127.0.0.1:17863';
+        $go_worker_secret = isset( $_POST['go_worker_secret'] ) ? trim( sanitize_text_field( wp_unslash( $_POST['go_worker_secret'] ) ) ) : '';
 
         if ( ! in_array( $auto_mode, array( 'none', 'compress', 'webp', 'both' ), true ) ) {
             $auto_mode = 'none';
+        }
+        if ( ! in_array( $worker_engine, array( 'cron', 'go' ), true ) ) {
+            $worker_engine = 'cron';
+        }
+        if ( 'go' === $worker_engine && strlen( $go_worker_secret ) < 32 ) {
+            $go_worker_secret = wp_generate_password( 48, false, false );
         }
 
         $settings = array(
@@ -305,6 +380,9 @@ final class MaoMoMo_TinyPNG_Media {
             'default_limit' => max( 1, $default_limit ),
             'include_sizes' => ! empty( $_POST['include_sizes'] ),
             'auto_mode'     => $auto_mode,
+            'worker_engine' => $worker_engine,
+            'go_worker_url' => $go_worker_url ? untrailingslashit( $go_worker_url ) : 'http://127.0.0.1:17863',
+            'go_worker_secret' => $go_worker_secret,
             'timeout'       => min( 300, max( 10, $timeout ) ),
             'proxy'         => trim( $proxy ),
         );
@@ -586,6 +664,9 @@ final class MaoMoMo_TinyPNG_Media {
         }
 
         try {
+            if ( $this->is_go_worker_enabled() ) {
+                $this->process_go_worker_queue();
+            }
             $this->fail_non_retryable_pending_queue_items();
             $this->recover_unstarted_queue_items();
             $this->recover_stale_queue_items();
@@ -593,9 +674,91 @@ final class MaoMoMo_TinyPNG_Media {
             $this->release_queue_dispatch_lock();
         }
 
-        if ( $this->count_queue_status( 'running' ) > 0 ) {
-            $this->schedule_queue_event( MINUTE_IN_SECONDS );
+        if ( $this->count_queue_status( 'pending' ) > 0 || $this->count_queue_status( 'running' ) > 0 ) {
+            $this->schedule_queue_event( 30 );
         }
+    }
+
+    public function dispatch_go_worker_on_shutdown() {
+        if ( ! $this->go_dispatch_requested || ! $this->is_go_worker_enabled() ) {
+            return;
+        }
+        if ( ! $this->acquire_queue_dispatch_lock() ) {
+            return;
+        }
+
+        try {
+            $this->process_go_worker_queue();
+        } finally {
+            $this->release_queue_dispatch_lock();
+        }
+    }
+
+    public function register_go_worker_routes() {
+        register_rest_route(
+            'maomomo-tinypng/v1',
+            '/results',
+            array(
+                'methods'             => WP_REST_Server::CREATABLE,
+                'callback'            => array( $this, 'receive_go_worker_results' ),
+                'permission_callback' => array( $this, 'verify_go_worker_callback' ),
+            )
+        );
+    }
+
+    public function verify_go_worker_callback( $request ) {
+        if ( ! $request instanceof WP_REST_Request || ! $this->is_go_worker_enabled() ) {
+            return new WP_Error( 'maomomo_go_worker_forbidden', 'Go Worker 回调未启用。', array( 'status' => 403 ) );
+        }
+
+        $timestamp = (string) $request->get_header( MaoMoMo_Go_Worker_Client::HEADER_TIMESTAMP );
+        $nonce     = (string) $request->get_header( MaoMoMo_Go_Worker_Client::HEADER_NONCE );
+        $signature = strtolower( (string) $request->get_header( MaoMoMo_Go_Worker_Client::HEADER_SIGNATURE ) );
+        if ( ! ctype_digit( $timestamp ) || strlen( $nonce ) < 16 || ! preg_match( '/\A[a-f0-9]{64}\z/', $signature ) ) {
+            return new WP_Error( 'maomomo_go_worker_signature', 'Go Worker 回调签名格式无效。', array( 'status' => 401 ) );
+        }
+        if ( abs( time() - (int) $timestamp ) > 90 ) {
+            return new WP_Error( 'maomomo_go_worker_expired', 'Go Worker 回调时间戳已过期。', array( 'status' => 401 ) );
+        }
+
+        $nonce_key = 'maomomo_go_nonce_' . substr( hash( 'sha256', $nonce ), 0, 32 );
+        if ( get_transient( $nonce_key ) ) {
+            return new WP_Error( 'maomomo_go_worker_replay', 'Go Worker 回调 nonce 已使用。', array( 'status' => 401 ) );
+        }
+
+        $request_uri = isset( $_SERVER['REQUEST_URI'] ) ? wp_unslash( $_SERVER['REQUEST_URI'] ) : '';
+        $body        = (string) $request->get_body();
+        $config      = $this->get_go_worker_configuration();
+        $message     = "POST\n" . $request_uri . "\n" . $timestamp . "\n" . $nonce . "\n" . $body;
+        $expected    = hash_hmac( 'sha256', $message, $config['secret'] );
+        if ( ! hash_equals( $expected, $signature ) ) {
+            return new WP_Error( 'maomomo_go_worker_signature', 'Go Worker 回调签名无效。', array( 'status' => 401 ) );
+        }
+
+        set_transient( $nonce_key, '1', 2 * MINUTE_IN_SECONDS );
+        return true;
+    }
+
+    public function receive_go_worker_results( $request ) {
+        $payload = $request instanceof WP_REST_Request ? $request->get_json_params() : array();
+        $results = is_array( $payload ) && ! empty( $payload['results'] ) && is_array( $payload['results'] )
+            ? array_slice( $payload['results'], 0, 10 )
+            : array();
+        if ( empty( $results ) ) {
+            return new WP_Error( 'maomomo_go_worker_results', 'Go Worker 回调没有任务结果。', array( 'status' => 400 ) );
+        }
+
+        foreach ( $results as $result ) {
+            if ( ! $this->finalize_go_worker_result( $result ) ) {
+                return new WP_Error( 'maomomo_go_worker_finalize', 'WordPress 暂时无法写回 Go Worker 结果，请稍后重试。', array( 'status' => 503 ) );
+            }
+        }
+
+        if ( $this->count_queue_status( 'pending' ) > 0 || $this->count_queue_status( 'running' ) > 0 ) {
+            $this->schedule_queue_event( 30 );
+        }
+
+        return rest_ensure_response( array( 'finalized' => count( $results ) ) );
     }
 
     /**
@@ -1579,7 +1742,9 @@ final class MaoMoMo_TinyPNG_Media {
                 $mode = $this->merge_modes( $existing_mode, $mode );
             }
 
-            $now = time();
+            $now      = time();
+            $go_mode  = $this->is_go_worker_enabled();
+            $run_delay = $go_mode ? 1 : max( 1, (int) $delay );
 
             // 运行期间的新请求只合并模式，由当前 Worker 完成后判断是否还需补跑，避免同一附件并发。
             if ( 'running' === $status ) {
@@ -1587,12 +1752,15 @@ final class MaoMoMo_TinyPNG_Media {
                 update_post_meta( $attachment_id, self::META_QUEUE_UPDATED_AT, $now );
                 delete_post_meta( $attachment_id, self::META_QUEUE_DONE_AT );
                 $this->schedule_queue_event( MINUTE_IN_SECONDS );
+                if ( $go_mode ) {
+                    $this->go_dispatch_requested = true;
+                }
                 return true;
             }
 
             update_post_meta( $attachment_id, self::META_QUEUE_STATUS, 'pending' );
             update_post_meta( $attachment_id, self::META_QUEUE_MODE, $mode );
-            update_post_meta( $attachment_id, self::META_QUEUE_NEXT_RUN, $now + max( 1, (int) $delay ) );
+            update_post_meta( $attachment_id, self::META_QUEUE_NEXT_RUN, $go_mode ? $now : $now + $run_delay );
             update_post_meta( $attachment_id, self::META_QUEUE_UPDATED_AT, $now );
             delete_post_meta( $attachment_id, self::META_QUEUE_DONE_AT );
             delete_post_meta( $attachment_id, self::META_QUEUE_CLAIM );
@@ -1602,7 +1770,10 @@ final class MaoMoMo_TinyPNG_Media {
             update_post_meta( $attachment_id, self::META_QUEUE_LAST_ERROR, '' );
             delete_post_meta( $attachment_id, self::META_QUEUE_SUMMARY );
 
-            $this->schedule_queue_event( (int) $delay );
+            $this->schedule_queue_event( $run_delay );
+            if ( $go_mode ) {
+                $this->go_dispatch_requested = true;
+            }
 
             return true;
         } finally {
@@ -2799,6 +2970,329 @@ final class MaoMoMo_TinyPNG_Media {
         return in_array( $ext, array( 'png', 'jpg', 'jpeg', 'webp', 'avif' ), true );
     }
 
+    private function is_go_worker_enabled() {
+        $settings = $this->get_settings();
+        return 'go' === $settings['worker_engine'] && $this->get_go_worker_client()->is_configured();
+    }
+
+    private function get_go_worker_configuration() {
+        $settings = $this->get_settings();
+        $url      = defined( 'MAOMOMO_TINYPNG_GO_WORKER_URL' )
+            ? (string) constant( 'MAOMOMO_TINYPNG_GO_WORKER_URL' )
+            : (string) $settings['go_worker_url'];
+        $secret   = defined( 'MAOMOMO_TINYPNG_GO_WORKER_SECRET' )
+            ? (string) constant( 'MAOMOMO_TINYPNG_GO_WORKER_SECRET' )
+            : (string) $settings['go_worker_secret'];
+
+        return array(
+            'url'     => untrailingslashit( trim( $url ) ),
+            'secret'  => trim( $secret ),
+            'site_id' => substr( hash( 'sha256', home_url( '/' ) ), 0, 32 ),
+            'callback_url' => defined( 'MAOMOMO_TINYPNG_GO_CALLBACK_URL' )
+                ? esc_url_raw( (string) constant( 'MAOMOMO_TINYPNG_GO_CALLBACK_URL' ) )
+                : rest_url( 'maomomo-tinypng/v1/results' ),
+        );
+    }
+
+    private function get_go_worker_client() {
+        $config = $this->get_go_worker_configuration();
+        return new MaoMoMo_Go_Worker_Client( $config['url'], $config['secret'] );
+    }
+
+    private function get_go_worker_install_configuration() {
+        $config     = $this->get_go_worker_configuration();
+        $upload_dir = wp_upload_dir();
+        $machine    = strtolower( php_uname( 'm' ) );
+        $arch       = in_array( $machine, array( 'aarch64', 'arm64' ), true ) ? 'arm64' : 'amd64';
+        $binary     = wp_normalize_path( __DIR__ . '/bin/maomomo-tinypng-worker-linux-' . $arch );
+        $unit       = wp_normalize_path( __DIR__ . '/worker/maomomo-tinypng-worker.service' );
+        $uploads    = ! empty( $upload_dir['basedir'] ) ? wp_normalize_path( $upload_dir['basedir'] ) : '/网站目录/wp-content/uploads';
+
+        $env_content = implode(
+            "\n",
+            array(
+                'MAOMOMO_WORKER_LISTEN=127.0.0.1:17863',
+                'MAOMOMO_WORKER_WORKERS=3',
+                'MAOMOMO_WORKER_SPOOL_DIR=/var/lib/maomomo-tinypng-worker',
+                'MAOMOMO_WORKER_SECRET=' . $config['secret'],
+                'MAOMOMO_WORKER_UPLOADS_ROOTS=' . $uploads,
+            )
+        );
+
+        return array(
+            'install_commands' => implode(
+                "\n",
+                array(
+                    'sudo install -m 0755 ' . $this->shell_command_arg( $binary ) . ' /usr/local/bin/maomomo-tinypng-worker',
+                    'sudo install -m 0644 ' . $this->shell_command_arg( $unit ) . ' /etc/systemd/system/maomomo-tinypng-worker.service',
+                    "sudo tee /etc/maomomo-tinypng-worker.env >/dev/null <<'MAOMOMO_ENV'",
+                    $env_content,
+                    'MAOMOMO_ENV',
+                    'sudo chmod 0600 /etc/maomomo-tinypng-worker.env',
+                )
+            ),
+            'env_content' => $env_content,
+            'start_commands' => implode(
+                "\n",
+                array(
+                    'sudo systemctl daemon-reload',
+                    'sudo systemctl enable --now maomomo-tinypng-worker',
+                    'sudo systemctl status maomomo-tinypng-worker --no-pager',
+                    'curl -sS http://127.0.0.1:17863/healthz',
+                )
+            ),
+        );
+    }
+
+    private function process_go_worker_queue() {
+        $client  = $this->get_go_worker_client();
+        $config  = $this->get_go_worker_configuration();
+        $response = $client->results( $config['site_id'] );
+
+        if ( is_wp_error( $response ) ) {
+            return false;
+        }
+
+        if ( ! empty( $response['active'] ) && is_array( $response['active'] ) ) {
+            foreach ( $response['active'] as $active ) {
+                if ( ! is_array( $active ) || empty( $active['job_id'] ) || empty( $active['attachment_id'] ) ) {
+                    continue;
+                }
+                $attachment_id = absint( $active['attachment_id'] );
+                $job_id        = sanitize_text_field( (string) $active['job_id'] );
+                if ( $attachment_id && $this->owns_queue_claim( $attachment_id, $job_id ) ) {
+                    update_post_meta( $attachment_id, self::META_QUEUE_UPDATED_AT, time() );
+                    update_post_meta( $attachment_id, self::META_QUEUE_WORKER_STARTED_AT, time() );
+                }
+            }
+        }
+
+        $ack_ids = array();
+        if ( ! empty( $response['results'] ) && is_array( $response['results'] ) ) {
+            foreach ( $response['results'] as $result ) {
+                if ( $this->finalize_go_worker_result( $result ) ) {
+                    $ack_ids[] = sanitize_text_field( isset( $result['job_id'] ) ? (string) $result['job_id'] : '' );
+                }
+            }
+        }
+        $ack_ids = array_values( array_filter( array_unique( $ack_ids ) ) );
+        if ( ! empty( $ack_ids ) ) {
+            $client->ack( $config['site_id'], $ack_ids );
+        }
+
+        foreach ( $this->get_due_queue_attachment_ids( 50 ) as $attachment_id ) {
+            $claim = $this->claim_queue_item( $attachment_id );
+            if ( ! $claim ) {
+                continue;
+            }
+
+            $job = $this->build_go_worker_job( $attachment_id, $claim );
+            if ( is_wp_error( $job ) ) {
+                $this->rollback_go_worker_claim( $attachment_id, $claim, $job->get_error_message() );
+                continue;
+            }
+
+            $accepted = $client->enqueue( $job );
+            if ( is_wp_error( $accepted ) || empty( $accepted['accepted'] ) ) {
+                $message = is_wp_error( $accepted ) ? $accepted->get_error_message() : 'Go Worker 未接受任务。';
+                $this->rollback_go_worker_claim( $attachment_id, $claim, $message );
+                break;
+            }
+
+            update_post_meta( $attachment_id, self::META_QUEUE_WORKER_STARTED_AT, time() );
+            update_post_meta( $attachment_id, self::META_QUEUE_UPDATED_AT, time() );
+        }
+
+        return true;
+    }
+
+    private function build_go_worker_job( $attachment_id, $claim ) {
+        $attachment_id = absint( $attachment_id );
+        $claim         = (string) $claim;
+        if ( ! $attachment_id || ! $this->owns_queue_claim( $attachment_id, $claim ) ) {
+            return new WP_Error( 'maomomo_go_worker_claim', 'Go Worker 任务领取状态无效。' );
+        }
+
+        $mode = sanitize_key( (string) get_post_meta( $attachment_id, self::META_QUEUE_MODE, true ) );
+        if ( ! in_array( $mode, array( 'compress', 'webp', 'both' ), true ) ) {
+            return new WP_Error( 'maomomo_go_worker_mode', 'Go Worker 处理模式无效。' );
+        }
+
+        $settings   = $this->get_settings();
+        $tokens     = $this->get_tokens();
+        $usage      = $this->get_usage();
+        $upload_dir = wp_upload_dir();
+        if ( empty( $tokens ) ) {
+            return new WP_Error( 'maomomo_go_worker_tokens', '请先在设置页配置 TinyPNG API Token。' );
+        }
+        if ( ! empty( $upload_dir['error'] ) || empty( $upload_dir['basedir'] ) ) {
+            return new WP_Error( 'maomomo_go_worker_uploads', '无法获取 WordPress uploads 目录。' );
+        }
+
+        $job_tokens = array();
+        foreach ( $tokens as $token ) {
+            $job_tokens[] = array(
+                'id'            => (string) $token['id'],
+                'name'          => (string) $token['name'],
+                'key'           => (string) $token['key'],
+                'monthly_limit' => (int) $token['monthly_limit'],
+                'count'         => $this->get_count( $usage, $token ),
+            );
+        }
+
+        $source_path    = '';
+        $webp_path      = '';
+        $compress_paths = array();
+        if ( in_array( $mode, array( 'compress', 'both' ), true ) ) {
+            $compress_paths = array_values( array_map( 'wp_normalize_path', $this->get_attachment_image_paths( $attachment_id ) ) );
+        }
+        if ( in_array( $mode, array( 'webp', 'both' ), true ) ) {
+            $source_path = get_attached_file( $attachment_id );
+            if ( ! $source_path || ! file_exists( $source_path ) ) {
+                return new WP_Error( 'maomomo_go_worker_source', '附件 #' . $attachment_id . ' 找不到原图文件。' );
+            }
+            $source_path = wp_normalize_path( $source_path );
+            if ( 'webp' !== strtolower( pathinfo( $source_path, PATHINFO_EXTENSION ) ) ) {
+                $webp_path = $this->get_or_create_webp_path( $attachment_id, $source_path );
+                if ( is_wp_error( $webp_path ) ) {
+                    return $webp_path;
+                }
+                $webp_path = wp_normalize_path( $webp_path );
+            }
+        }
+
+        $config = $this->get_go_worker_configuration();
+        return array(
+            'job_id'          => $claim,
+            'site_id'         => $config['site_id'],
+            'attachment_id'   => $attachment_id,
+            'mode'            => $mode,
+            'uploads_root'    => wp_normalize_path( $upload_dir['basedir'] ),
+            'compress_paths'  => $compress_paths,
+            'source_path'     => $source_path,
+            'webp_path'       => $webp_path,
+            'tokens'          => $job_tokens,
+            'timeout_seconds' => (int) $settings['timeout'],
+            'proxy'           => (string) $settings['proxy'],
+            'callback_url'    => $config['callback_url'],
+            'created_at'      => time(),
+        );
+    }
+
+    private function rollback_go_worker_claim( $attachment_id, $claim, $message ) {
+        if ( ! $this->acquire_queue_item_lock( $attachment_id ) ) {
+            return;
+        }
+
+        try {
+            if ( ! $this->owns_queue_claim( $attachment_id, $claim ) ) {
+                return;
+            }
+            $attempts = max( 0, (int) get_post_meta( $attachment_id, self::META_QUEUE_ATTEMPTS, true ) - 1 );
+            update_post_meta( $attachment_id, self::META_QUEUE_ATTEMPTS, $attempts );
+            update_post_meta( $attachment_id, self::META_QUEUE_NEXT_RUN, time() + MINUTE_IN_SECONDS );
+            update_post_meta( $attachment_id, self::META_QUEUE_LAST_ERROR, sanitize_text_field( (string) $message ) );
+            update_post_meta( $attachment_id, self::META_QUEUE_UPDATED_AT, time() );
+            delete_post_meta( $attachment_id, self::META_QUEUE_CLAIM );
+            delete_post_meta( $attachment_id, self::META_QUEUE_WORKER_STARTED_AT );
+            update_post_meta( $attachment_id, self::META_QUEUE_STATUS, 'pending', 'running' );
+        } finally {
+            $this->release_queue_item_lock( $attachment_id );
+        }
+    }
+
+    private function finalize_go_worker_result( $result ) {
+        if ( ! is_array( $result ) ) {
+            return true;
+        }
+        $config = $this->get_go_worker_configuration();
+        if ( empty( $result['site_id'] ) || ! hash_equals( $config['site_id'], (string) $result['site_id'] ) ) {
+            return true;
+        }
+        $attachment_id = isset( $result['attachment_id'] ) ? absint( $result['attachment_id'] ) : 0;
+        $claim         = isset( $result['job_id'] ) ? sanitize_text_field( (string) $result['job_id'] ) : '';
+        $mode          = isset( $result['mode'] ) ? sanitize_key( (string) $result['mode'] ) : '';
+        if ( ! $attachment_id || '' === $claim || ! in_array( $mode, array( 'compress', 'webp', 'both' ), true ) ) {
+            return true;
+        }
+
+        if ( ! $this->owns_queue_claim( $attachment_id, $claim ) ) {
+            return true;
+        }
+
+        $summary = $this->normalize_go_worker_summary( isset( $result['summary'] ) ? $result['summary'] : array() );
+        if ( ! empty( $result['usage'] ) && is_array( $result['usage'] ) ) {
+            $usage = $this->get_usage();
+            foreach ( $result['usage'] as $token_id => $count ) {
+                $token_id = sanitize_key( (string) $token_id );
+                if ( '' !== $token_id ) {
+                    $usage['usage'][ $token_id ] = max(
+                        isset( $usage['usage'][ $token_id ] ) ? (int) $usage['usage'][ $token_id ] : 0,
+                        max( 0, (int) $count )
+                    );
+                }
+            }
+            $this->save_usage( $usage );
+        }
+
+        if ( in_array( $mode, array( 'compress', 'both' ), true ) ) {
+            $this->refresh_attachment_filesizes( $attachment_id );
+        }
+        if ( ! empty( $result['webp_path'] ) && $summary['webp'] > 0 ) {
+            $webp_path = wp_normalize_path( (string) $result['webp_path'] );
+            if ( ! $this->is_path_in_uploads( $webp_path ) ) {
+                $summary['failed']++;
+                $summary['messages'][] = 'Go Worker 返回的 WebP 路径不在 uploads 目录。';
+            } else {
+                $webp_id = $this->upsert_webp_attachment( $attachment_id, $webp_path );
+                if ( is_wp_error( $webp_id ) ) {
+                    $summary['failed']++;
+                    $summary['messages'][] = $webp_id->get_error_message();
+                }
+            }
+        }
+
+        if ( 0 === $summary['failed'] ) {
+            update_post_meta(
+                $attachment_id,
+                '_maomomo_tinypng_last_result',
+                array(
+                    'label' => $this->mode_label( $mode ),
+                    'time'  => current_time( 'mysql' ),
+                    'saved' => $summary['bytes_before'] > $summary['bytes_after']
+                        ? $summary['bytes_before'] - $summary['bytes_after']
+                        : 0,
+                )
+            );
+            do_action( 'maomomo_tinypng_attachment_processed', $attachment_id, $mode, $summary );
+        }
+
+        $attempts = max( 1, (int) get_post_meta( $attachment_id, self::META_QUEUE_ATTEMPTS, true ) );
+        return $this->finish_queue_item( $attachment_id, $claim, $mode, $attempts, $summary, $summary['failed'] > 0 );
+    }
+
+    private function normalize_go_worker_summary( $raw ) {
+        $summary = $this->empty_summary();
+        if ( ! is_array( $raw ) ) {
+            $summary['failed']++;
+            $summary['messages'][] = 'Go Worker 返回了无效处理结果。';
+            return $summary;
+        }
+
+        foreach ( array( 'ok', 'failed', 'skipped', 'webp', 'bytes_before', 'bytes_after' ) as $key ) {
+            $summary[ $key ] = isset( $raw[ $key ] ) ? max( 0, (int) $raw[ $key ] ) : 0;
+        }
+        if ( ! empty( $raw['messages'] ) && is_array( $raw['messages'] ) ) {
+            foreach ( array_slice( $raw['messages'], 0, 20 ) as $message ) {
+                $message = sanitize_text_field( (string) $message );
+                if ( '' !== $message ) {
+                    $summary['messages'][] = $message;
+                }
+            }
+        }
+        return $summary;
+    }
+
     private function get_queue_cron_configuration() {
         // ABSPATH 不受 open_basedir 对站点外系统目录的限制；异常环境再从插件目录反推 WordPress 根目录。
         $wordpress_path = defined( 'ABSPATH' ) && ABSPATH
@@ -2958,6 +3452,9 @@ final class MaoMoMo_TinyPNG_Media {
             'default_limit' => self::DEFAULT_LIMIT,
             'include_sizes' => true,
             'auto_mode'     => 'none',
+            'worker_engine' => 'cron',
+            'go_worker_url' => 'http://127.0.0.1:17863',
+            'go_worker_secret' => '',
             'timeout'       => 90,
             'proxy'         => '',
         );

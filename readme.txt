@@ -2,7 +2,7 @@
 Contributors: maomomo
 Requires at least: 5.8
 Requires PHP: 7.4
-Stable tag: 1.6.3
+Stable tag: 1.7.0
 
 在 WordPress 媒体库中使用多个 TinyPNG API Token 轮换压缩图片，并支持转换 WebP。
 
@@ -32,7 +32,26 @@ Stable tag: 1.6.3
 5. 如需新上传图片自动处理，在「上传后自动处理」中选择模式；启用后图片会先加入后台队列。
 6. 到「媒体 → 媒体库」使用行操作或批量操作；批量操作会先加入后台队列。
 
-自动处理需要配置下方 3 条系统 Cron。WP-Cron 只维护和回收异常队列状态，不再通过 `admin-ajax.php` 回环请求执行图片任务。
+后台处理支持 Go 常驻服务和 WP-CLI 系统 Cron 两种引擎。推荐小内存服务器使用 Go 常驻服务；WP-CLI Cron 可作为无需额外服务的兼容方案。
+
+== Go 常驻服务 3 Worker ==
+
+Go 服务使用固定 3 个 goroutine 做附件级并发，空闲时不会启动 WordPress。图片通过本机文件路径处理，TinyPNG 响应流式写入临时文件，成功后再原子替换。
+
+1. 在插件设置页选择「Go 常驻服务」。
+2. 保存后复制设置页生成的 systemd 部署命令和环境变量。
+3. 服务只监听 `127.0.0.1:17863`，以站点 PHP 用户运行。
+4. 确认设置页显示 Go Worker 已连接后，停用旧的 3 条图片 Worker Cron。
+
+任务先以权限 `0600` 持久化到 `/var/lib/maomomo-tinypng-worker`，服务重启会自动恢复。插件与服务之间使用 HMAC-SHA256、时间戳和一次性 nonce；Go 只允许读写配置指定的 WordPress uploads 目录，不直接修改 WordPress 数据库。
+
+正式 Release 的插件 ZIP 内含：
+
+* `bin/maomomo-tinypng-worker-linux-amd64`
+* `bin/maomomo-tinypng-worker-linux-arm64`
+* `worker/maomomo-tinypng-worker.service`
+
+Go 完成任务后会批量回调 WordPress 写回附件 metadata；回调不可达时，WordPress 仍会通过队列轮询收取结果。
 
 == 系统 Cron 3 Worker ==
 
@@ -45,6 +64,8 @@ Stable tag: 1.6.3
 `* * * * * flock -n /tmp/maomomo-worker-3.lock php /网站目录/wp-cli.phar --path=/网站目录 --skip-plugins=其他插件slug --skip-themes maomomo-tinypng-worker --slot=3 --time-limit=50 --max-jobs=10 >/dev/null 2>&1`
 
 每个槽位同时只允许运行一个进程；即使上一分钟的任务尚未结束，也不会重复启动同槽位 Worker。插件内部还有 MySQL 槽位锁和附件领取锁，防止同一附件被重复处理。
+
+Go 模式正常运行时不要同时配置这 3 条 Cron；它们仅作为兼容或故障降级方案。
 
 == WP-CLI 用法 ==
 
@@ -113,6 +134,16 @@ TOKEN_2
 从 1.5.0 开始，插件支持在 WordPress 后台检查并安装 GitHub 正式 Release。1.4.0 及更早版本尚未包含更新检查器，需要先手动安装一次 1.5.0 或更高版本。
 
 == 更新日志 ==
+
+= 1.7.0 =
+
+* 新增 Go 常驻服务处理引擎，固定 3 个 goroutine 实现附件级并发，取消每分钟空启动多套 WordPress。
+* Go Worker 使用磁盘持久化队列，进程重启自动恢复未完成任务。
+* TinyPNG 上传和下载改为流式 I/O，临时文件成功落盘后再原子替换原文件。
+* Go 与 WordPress 之间使用 HMAC-SHA256、时间戳和一次性 nonce，服务只允许访问配置的 uploads 根目录。
+* Go 完成结果支持批量回调 WordPress；失败时保留结果并由 WordPress 后续轮询收取。
+* 正式 Release 同时发布 Linux AMD64、ARM64 静态二进制，后台按当前站点生成 systemd 部署命令。
+* 保留 WP-CLI Cron 引擎作为兼容和故障降级方案。
 
 = 1.6.3 =
 
