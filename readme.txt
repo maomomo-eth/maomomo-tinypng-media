@@ -2,7 +2,7 @@
 Contributors: maomomo
 Requires at least: 5.8
 Requires PHP: 7.4
-Stable tag: 1.7.1
+Stable tag: 1.7.2
 
 在 WordPress 媒体库中使用多个 TinyPNG API Token 轮换压缩图片，并支持转换 WebP。
 
@@ -52,6 +52,20 @@ Go 服务使用固定 3 个 goroutine 做附件级并发，空闲时不会启动
 * `worker/maomomo-tinypng-worker.service`
 
 Go 完成任务后会批量回调 WordPress 写回附件 metadata；回调不可达时，WordPress 仍会通过队列轮询收取结果。
+
+== 一台服务器运行多个 WordPress ==
+
+同一 Linux 用户（例如宝塔默认的 `www`）运行的多个 WordPress，推荐共用一个 Go Worker。systemd 服务只部署一次，3 个 Worker 是整台服务器的全局并发数，不是每个站点各 3 个。
+
+1. 每个站点都选择 Go 模式，并使用同一个 Worker 地址，例如 `http://127.0.0.1:17863`。
+2. 每个站点的 Go Worker 共享密钥必须与 `/etc/maomomo-tinypng-worker.env` 中的 `MAOMOMO_WORKER_SECRET` 完全相同。可在各站设置页填写同一密钥，也可在各站 `wp-config.php` 中定义相同的 `MAOMOMO_TINYPNG_GO_WORKER_URL` 和 `MAOMOMO_TINYPNG_GO_WORKER_SECRET`。
+3. 修改 `MAOMOMO_WORKER_UPLOADS_ROOTS`，用英文逗号列出全部站点的 uploads 绝对路径，例如：
+
+`MAOMOMO_WORKER_UPLOADS_ROOTS=/www/wwwroot/site1.com/wp-content/uploads,/www/wwwroot/site2.com/wp-content/uploads,/www/wwwroot/site3.com/wp-content/uploads`
+
+4. 修改环境文件后执行 `systemctl restart maomomo-tinypng-worker`，再到每个站点设置页确认 Worker 已连接。
+
+每个站点仍使用自己配置的 TinyPNG API Token。插件提交任务时会携带各站 Token、独立的站点 ID 和回调地址，Go Worker 会按站点写回结果。如果各站由不同 Linux 用户运行，或需要严格安全隔离，应改为每站一个独立 Worker 实例，并分别配置端口、共享密钥、spool 目录和 uploads 根目录。
 
 == 系统 Cron 3 Worker ==
 
@@ -134,6 +148,10 @@ TOKEN_2
 从 1.5.0 开始，插件支持在 WordPress 后台检查并安装 GitHub 正式 Release。1.4.0 及更早版本尚未包含更新检查器，需要先手动安装一次 1.5.0 或更高版本。
 
 == 更新日志 ==
+
+= 1.7.2 =
+
+* 补充一台服务器多个 WordPress 共用一个 Go Worker 的配置方法和安全隔离说明。
 
 = 1.7.1 =
 

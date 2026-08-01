@@ -12,6 +12,32 @@ Go 常驻服务负责附件级 3 Worker 并发、TinyPNG API 请求、流式文�
 | `MAOMOMO_WORKER_SECRET` | 无 | 与插件相同的 HMAC 共享密钥，至少 32 个字符。 |
 | `MAOMOMO_WORKER_UPLOADS_ROOTS` | 无 | 允许读写的 WordPress uploads 绝对路径，多个路径用英文逗号分隔。 |
 
+## 多个 WordPress 共用一个服务
+
+同一服务器、同一 Linux 用户下的多个 WordPress 推荐共用一个 Go Worker，避免为每个站点分别常驻进程。服务只部署一次，`MAOMOMO_WORKER_WORKERS=3` 表示整台服务器共享 3 个附件级并发。
+
+所有站点必须使用相同的 Worker 地址和 HMAC 共享密钥。可在各站插件设置页填写相同内容，也可在各站 `wp-config.php` 中定义：
+
+```php
+define( 'MAOMOMO_TINYPNG_GO_WORKER_URL', 'http://127.0.0.1:17863' );
+define( 'MAOMOMO_TINYPNG_GO_WORKER_SECRET', '替换为与服务环境文件完全相同的共享密钥' );
+```
+
+在 `/etc/maomomo-tinypng-worker.env` 中用英文逗号列出全部 uploads 目录：
+
+```ini
+MAOMOMO_WORKER_UPLOADS_ROOTS=/www/wwwroot/site1.com/wp-content/uploads,/www/wwwroot/site2.com/wp-content/uploads,/www/wwwroot/site3.com/wp-content/uploads
+```
+
+修改后重启并检查服务：
+
+```bash
+systemctl restart maomomo-tinypng-worker
+systemctl status maomomo-tinypng-worker --no-pager
+```
+
+每个 WordPress 使用自己的 TinyPNG API Token。任务中的站点 ID 和回调地址用于隔离结果；Go 的磁盘结果不会写回其他站点。如果站点属于不同 Linux 用户或需要严格安全隔离，请为每个站点创建独立 systemd 实例，并分别使用不同端口、共享密钥、spool 目录和 uploads 根目录。
+
 ## 源码验证
 
 ```bash
