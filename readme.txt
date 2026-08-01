@@ -2,7 +2,7 @@
 Contributors: maomomo
 Requires at least: 5.8
 Requires PHP: 7.4
-Stable tag: 1.7.0
+Stable tag: 1.7.1
 
 在 WordPress 媒体库中使用多个 TinyPNG API Token 轮换压缩图片，并支持转换 WebP。
 
@@ -134,6 +134,11 @@ TOKEN_2
 从 1.5.0 开始，插件支持在 WordPress 后台检查并安装 GitHub 正式 Release。1.4.0 及更早版本尚未包含更新检查器，需要先手动安装一次 1.5.0 或更高版本。
 
 == 更新日志 ==
+
+= 1.7.1 =
+
+* 设置页根据当前处理引擎显示对应配置和部署命令，Go 模式隐藏 WP-CLI Cron 内容。
+* Go systemd 部署命令和 WP-CLI Cron 均新增一键复制按钮。
 
 = 1.7.0 =
 

@@ -3,7 +3,7 @@
  * Plugin Name: MaoMoMo TinyPNG Media
  * Plugin URI: https://www.maomomo.com
  * Description: 在媒体库中使用多个 TinyPNG API Token 轮换压缩图片，并支持转换 WebP。
- * Version: 1.7.0
+ * Version: 1.7.1
  * Author: MAOMOMO
  * Author URI: https://www.maomomo.com
  * Requires at least: 5.8
@@ -106,14 +106,15 @@ final class MaoMoMo_TinyPNG_Media {
             return;
         }
 
-        $settings = $this->get_settings();
-        $tokens   = $this->get_tokens();
-        $usage    = $this->get_usage();
-        $queue_counts = $this->get_queue_counts();
-        $cron_config = $this->get_queue_cron_configuration();
-        $go_config = $this->get_go_worker_configuration();
-        $go_install = $this->get_go_worker_install_configuration();
-        $go_health = 'go' === $settings['worker_engine']
+        $settings           = $this->get_settings();
+        $tokens             = $this->get_tokens();
+        $usage              = $this->get_usage();
+        $queue_counts       = $this->get_queue_counts();
+        $cron_config        = $this->get_queue_cron_configuration();
+        $go_config          = $this->get_go_worker_configuration();
+        $go_install         = $this->get_go_worker_install_configuration();
+        $go_deploy_commands = trim( $go_install['install_commands'] . "\n" . $go_install['start_commands'] );
+        $go_health          = 'go' === $settings['worker_engine']
             ? $this->get_go_worker_client()->health()
             : null;
         ?>
@@ -185,7 +186,7 @@ final class MaoMoMo_TinyPNG_Media {
                             <p class="description">Go 模式不会每分钟空启动多套 WordPress；Go 负责 TinyPNG 请求和文件写入，WordPress 只负责入队及附件 metadata 写回。</p>
                         </td>
                     </tr>
-                    <tr>
+                    <tr data-maomomo-worker-engine-section="go"<?php if ( 'go' !== $settings['worker_engine'] ) : ?> hidden<?php endif; ?>>
                         <th scope="row"><label for="maomomo-tinypng-go-worker-url">Go Worker 地址</label></th>
                         <td>
                             <input
@@ -199,7 +200,7 @@ final class MaoMoMo_TinyPNG_Media {
                             <p class="description">只允许 <code>127.0.0.1</code>、<code>localhost</code> 或 <code>::1</code>，不会向公网发送 Token 或文件路径。</p>
                         </td>
                     </tr>
-                    <tr>
+                    <tr data-maomomo-worker-engine-section="go"<?php if ( 'go' !== $settings['worker_engine'] ) : ?> hidden<?php endif; ?>>
                         <th scope="row"><label for="maomomo-tinypng-go-worker-secret">Go Worker 共享密钥</label></th>
                         <td>
                             <input
@@ -282,21 +283,6 @@ final class MaoMoMo_TinyPNG_Media {
             </form>
 
             <h2>后台队列</h2>
-            <?php if ( 'go' === $settings['worker_engine'] ) : ?>
-                <?php if ( is_wp_error( $go_health ) ) : ?>
-                    <div class="notice notice-warning inline"><p>Go Worker 未连接：<?php echo esc_html( $go_health->get_error_message() ); ?></p></div>
-                <?php else : ?>
-                    <div class="notice notice-success inline"><p>Go Worker 已连接：版本 <code><?php echo esc_html( isset( $go_health['version'] ) ? $go_health['version'] : '未知' ); ?></code>，附件级并发 <code><?php echo esc_html( isset( $go_health['workers'] ) ? (string) $go_health['workers'] : '未知' ); ?></code>。</p></div>
-                <?php endif; ?>
-                <details style="max-width: 1000px; margin: 12px 0;">
-                    <summary><strong>Go Worker systemd 部署命令</strong></summary>
-                    <p class="description">先升级到包含当前架构二进制的正式 Release，再以 root 执行。以下路径和共享密钥已按当前站点生成。</p>
-                    <pre style="overflow: auto; padding: 12px; background: #f6f7f7;"><code><?php echo esc_html( $go_install['install_commands'] ); ?></code></pre>
-                    <p><code>/etc/maomomo-tinypng-worker.env</code> 内容：</p>
-                    <pre style="overflow: auto; padding: 12px; background: #f6f7f7;"><code><?php echo esc_html( $go_install['env_content'] ); ?></code></pre>
-                    <pre style="overflow: auto; padding: 12px; background: #f6f7f7;"><code><?php echo esc_html( $go_install['start_commands'] ); ?></code></pre>
-                </details>
-            <?php endif; ?>
             <table class="widefat striped" style="max-width: 620px;">
                 <tbody>
                     <tr>
@@ -317,27 +303,50 @@ final class MaoMoMo_TinyPNG_Media {
                     </tr>
                 </tbody>
             </table>
-            <?php if ( 'go' === $settings['worker_engine'] ) : ?>
+
+            <div data-maomomo-worker-engine-section="go"<?php if ( 'go' !== $settings['worker_engine'] ) : ?> hidden<?php endif; ?>>
                 <p class="description">Go 常驻服务使用 3 个轻量 Worker 做附件级并发。同一附件的原图和缩略图仍会依次处理；请停用旧的 3 条图片 Worker Cron，WP-Cron 只负责提交任务和写回结果。</p>
-            <?php else : ?>
+                <?php if ( null === $go_health ) : ?>
+                    <div class="notice notice-info inline"><p>保存 Go 模式后将检测 Worker 连接状态并生成共享密钥。</p></div>
+                <?php elseif ( is_wp_error( $go_health ) ) : ?>
+                    <div class="notice notice-warning inline"><p>Go Worker 未连接：<?php echo esc_html( $go_health->get_error_message() ); ?></p></div>
+                <?php else : ?>
+                    <div class="notice notice-success inline"><p>Go Worker 已连接：版本 <code><?php echo esc_html( isset( $go_health['version'] ) ? $go_health['version'] : '未知' ); ?></code>，附件级并发 <code><?php echo esc_html( isset( $go_health['workers'] ) ? (string) $go_health['workers'] : '未知' ); ?></code>。</p></div>
+                <?php endif; ?>
+                <details style="max-width: 1000px; margin: 12px 0;">
+                    <summary><strong>Go Worker systemd 部署命令</strong></summary>
+                    <p class="description">先升级到包含当前架构二进制的正式 Release，再以 root 执行。以下路径和共享密钥已按当前站点生成。</p>
+                    <p>
+                        <button type="button" class="button maomomo-copy-command" data-copy-target="maomomo-go-deploy-commands">一键复制 Go 部署命令</button>
+                        <span class="maomomo-copy-status" aria-live="polite"></span>
+                    </p>
+                    <pre style="overflow: auto; padding: 12px; background: #f6f7f7;"><code id="maomomo-go-deploy-commands"><?php echo esc_html( $go_deploy_commands ); ?></code></pre>
+                </details>
+            </div>
+
+            <div data-maomomo-worker-engine-section="cron"<?php if ( 'cron' !== $settings['worker_engine'] ) : ?> hidden<?php endif; ?>>
                 <p class="description">队列使用 3 个独立 WP-CLI Worker 并发处理，同一附件的原图和缩略图仍会依次处理。请在服务器中配置下方 3 条系统 Cron；WP-Cron 只负责队列维护，不会处理图片。</p>
-            <?php endif; ?>
-            <?php if ( empty( $cron_config['missing'] ) ) : ?>
-                <p class="description">
-                    当前生成路径：PHP <code><?php echo esc_html( $cron_config['php_binary'] ); ?></code>；
-                    WP-CLI <code><?php echo esc_html( $cron_config['wp_cli'] ); ?></code>；
-                    WordPress <code><?php echo esc_html( $cron_config['wordpress_path'] ); ?></code>。
-                </p>
-                <p class="description">
-                    性能优化：已加入 <code>--skip-themes</code>
-                    <?php if ( ! empty( $cron_config['skip_plugins'] ) ) : ?>，并排除其他 <?php echo esc_html( (string) count( $cron_config['skip_plugins'] ) ); ?> 个已启用插件：<code><?php echo esc_html( implode( ',', $cron_config['skip_plugins'] ) ); ?></code><?php else : ?>；当前没有需要排除的其他已启用插件<?php endif; ?>。
-                </p>
-                <pre style="max-width: 100%; overflow: auto; padding: 12px; background: #f6f7f7;"><code><?php echo esc_html( implode( "\n", $cron_config['commands'] ) ); ?></code></pre>
-            <?php else : ?>
-                <div class="notice notice-warning inline">
-                    <p>无法生成可直接使用的 Cron：未检测到 <?php echo esc_html( implode( '、', $cron_config['missing'] ) ); ?>。可在 <code>wp-config.php</code> 中定义 <code>MAOMOMO_TINYPNG_PHP_BINARY</code>、<code>MAOMOMO_TINYPNG_WP_CLI_PATH</code> 或 <code>MAOMOMO_TINYPNG_FLOCK_PATH</code> 后刷新本页。</p>
-                </div>
-            <?php endif; ?>
+                <?php if ( empty( $cron_config['missing'] ) ) : ?>
+                    <p class="description">
+                        当前生成路径：PHP <code><?php echo esc_html( $cron_config['php_binary'] ); ?></code>；
+                        WP-CLI <code><?php echo esc_html( $cron_config['wp_cli'] ); ?></code>；
+                        WordPress <code><?php echo esc_html( $cron_config['wordpress_path'] ); ?></code>。
+                    </p>
+                    <p class="description">
+                        性能优化：已加入 <code>--skip-themes</code>
+                        <?php if ( ! empty( $cron_config['skip_plugins'] ) ) : ?>，并排除其他 <?php echo esc_html( (string) count( $cron_config['skip_plugins'] ) ); ?> 个已启用插件：<code><?php echo esc_html( implode( ',', $cron_config['skip_plugins'] ) ); ?></code><?php else : ?>；当前没有需要排除的其他已启用插件<?php endif; ?>。
+                    </p>
+                    <p>
+                        <button type="button" class="button maomomo-copy-command" data-copy-target="maomomo-cron-commands">一键复制 WP-CLI Cron</button>
+                        <span class="maomomo-copy-status" aria-live="polite"></span>
+                    </p>
+                    <pre style="max-width: 100%; overflow: auto; padding: 12px; background: #f6f7f7;"><code id="maomomo-cron-commands"><?php echo esc_html( implode( "\n", $cron_config['commands'] ) ); ?></code></pre>
+                <?php else : ?>
+                    <div class="notice notice-warning inline">
+                        <p>无法生成可直接使用的 Cron：未检测到 <?php echo esc_html( implode( '、', $cron_config['missing'] ) ); ?>。可在 <code>wp-config.php</code> 中定义 <code>MAOMOMO_TINYPNG_PHP_BINARY</code>、<code>MAOMOMO_TINYPNG_WP_CLI_PATH</code> 或 <code>MAOMOMO_TINYPNG_FLOCK_PATH</code> 后刷新本页。</p>
+                    </div>
+                <?php endif; ?>
+            </div>
 
             <form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" style="margin-top: 12px;">
                 <?php wp_nonce_field( 'maomomo_tinypng_fix_webp_paths' ); ?>
@@ -345,6 +354,78 @@ final class MaoMoMo_TinyPNG_Media {
                 <?php submit_button( '修复已生成 WebP 附件路径', 'secondary', 'submit', false ); ?>
                 <p class="description">如果在 Windows 环境中出现 <code>2026/05filename.webp</code> 这类少一个斜杠的 URL，可点击此按钮修复。</p>
             </form>
+
+            <script>
+            ( function() {
+                var engineSelect = document.getElementById( 'maomomo-tinypng-worker-engine' );
+                var sections = document.querySelectorAll( '[data-maomomo-worker-engine-section]' );
+
+                function syncWorkerSections() {
+                    var selectedEngine = engineSelect ? engineSelect.value : 'cron';
+                    Array.prototype.forEach.call( sections, function( section ) {
+                        section.hidden = section.getAttribute( 'data-maomomo-worker-engine-section' ) !== selectedEngine;
+                    } );
+                }
+
+                function fallbackCopy( text ) {
+                    var textarea = document.createElement( 'textarea' );
+                    textarea.value = text;
+                    textarea.setAttribute( 'readonly', 'readonly' );
+                    textarea.style.position = 'fixed';
+                    textarea.style.left = '-9999px';
+                    document.body.appendChild( textarea );
+                    textarea.select();
+
+                    var copied = false;
+                    try {
+                        copied = document.execCommand( 'copy' );
+                    } catch ( error ) {
+                        copied = false;
+                    }
+                    document.body.removeChild( textarea );
+                    return copied;
+                }
+
+                function showCopyResult( button, copied ) {
+                    var status = button.parentNode.querySelector( '.maomomo-copy-status' );
+                    if ( status ) {
+                        status.textContent = copied ? ' 已复制' : ' 复制失败，请手动选择命令';
+                        window.setTimeout( function() {
+                            status.textContent = '';
+                        }, 2500 );
+                    }
+                }
+
+                Array.prototype.forEach.call( document.querySelectorAll( '.maomomo-copy-command' ), function( button ) {
+                    button.addEventListener( 'click', function() {
+                        var target = document.getElementById( button.getAttribute( 'data-copy-target' ) );
+                        var text = target ? target.textContent : '';
+                        if ( ! text ) {
+                            showCopyResult( button, false );
+                            return;
+                        }
+
+                        if ( navigator.clipboard && window.isSecureContext ) {
+                            navigator.clipboard.writeText( text ).then(
+                                function() {
+                                    showCopyResult( button, true );
+                                },
+                                function() {
+                                    showCopyResult( button, fallbackCopy( text ) );
+                                }
+                            );
+                            return;
+                        }
+                        showCopyResult( button, fallbackCopy( text ) );
+                    } );
+                } );
+
+                if ( engineSelect ) {
+                    engineSelect.addEventListener( 'change', syncWorkerSections );
+                }
+                syncWorkerSections();
+            }() );
+            </script>
         </div>
         <?php
     }
