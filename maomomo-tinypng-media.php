@@ -3,7 +3,7 @@
  * Plugin Name: MaoMoMo TinyPNG Media
  * Plugin URI: https://www.maomomo.com
  * Description: 在媒体库中使用多个 TinyPNG API Token 轮换压缩图片，并支持转换 WebP。
- * Version: 1.7.2
+ * Version: 1.7.3
  * Author: MAOMOMO
  * Author URI: https://www.maomomo.com
  * Requires at least: 5.8
@@ -47,6 +47,7 @@ final class MaoMoMo_TinyPNG_Media {
     const META_QUEUE_LAST_ERROR = '_maomomo_tinypng_queue_last_error';
     const META_QUEUE_SUMMARY    = '_maomomo_tinypng_queue_summary';
     const META_QUEUE_CLAIM      = '_maomomo_tinypng_queue_claim';
+    const META_QUEUE_DELETE_ORIGINAL = '_maomomo_tinypng_queue_delete_original';
 
     private static $instance = null;
 
@@ -171,9 +172,11 @@ final class MaoMoMo_TinyPNG_Media {
                                 <option value="none" <?php selected( $settings['auto_mode'], 'none' ); ?>>不自动处理</option>
                                 <option value="compress" <?php selected( $settings['auto_mode'], 'compress' ); ?>>自动 TinyPNG 压缩</option>
                                 <option value="webp" <?php selected( $settings['auto_mode'], 'webp' ); ?>>自动转 WebP</option>
+                                <option value="webp_delete_original" <?php selected( $settings['auto_mode'], 'webp_delete_original' ); ?>>自动转 WebP 并删除原文件</option>
                                 <option value="both" <?php selected( $settings['auto_mode'], 'both' ); ?>>自动压缩并转 WebP</option>
                             </select>
                             <p class="description">启用后，新上传到媒体库的图片会在 WordPress 生成附件元数据后加入后台队列，由下方选择的处理引擎异步执行。</p>
+                            <p class="description"><strong>删除原文件</strong>模式只在 WebP 成功生成并写回附件后删除旧原图和旧缩略图；附件 ID 保持不变。此操作不可撤销。</p>
                         </td>
                     </tr>
                     <tr>
@@ -446,7 +449,7 @@ final class MaoMoMo_TinyPNG_Media {
         $go_worker_url = isset( $_POST['go_worker_url'] ) ? esc_url_raw( wp_unslash( $_POST['go_worker_url'] ) ) : 'http://127.0.0.1:17863';
         $go_worker_secret = isset( $_POST['go_worker_secret'] ) ? trim( sanitize_text_field( wp_unslash( $_POST['go_worker_secret'] ) ) ) : '';
 
-        if ( ! in_array( $auto_mode, array( 'none', 'compress', 'webp', 'both' ), true ) ) {
+        if ( ! in_array( $auto_mode, array( 'none', 'compress', 'webp', 'webp_delete_original', 'both' ), true ) ) {
             $auto_mode = 'none';
         }
         if ( ! in_array( $worker_engine, array( 'cron', 'go' ), true ) ) {
@@ -720,7 +723,7 @@ final class MaoMoMo_TinyPNG_Media {
         $settings  = $this->get_settings();
         $auto_mode = isset( $settings['auto_mode'] ) ? $settings['auto_mode'] : 'none';
 
-        if ( ! in_array( $auto_mode, array( 'compress', 'webp', 'both' ), true ) ) {
+        if ( ! in_array( $auto_mode, array( 'compress', 'webp', 'webp_delete_original', 'both' ), true ) ) {
             return $metadata;
         }
 
@@ -732,7 +735,9 @@ final class MaoMoMo_TinyPNG_Media {
             update_post_meta( $attachment_id, '_wp_attachment_metadata', $metadata );
         }
 
-        $this->enqueue_attachment( $attachment_id, $auto_mode, 30 );
+        $delete_original = 'webp_delete_original' === $auto_mode;
+        $queue_mode      = $delete_original ? 'webp' : $auto_mode;
+        $this->enqueue_attachment( $attachment_id, $queue_mode, 30, $delete_original );
         $this->store_notice( 'info', '上传后自动处理已加入 TinyPNG 后台队列。' );
 
         return $metadata;
@@ -1803,9 +1808,10 @@ final class MaoMoMo_TinyPNG_Media {
         return '<a href="' . esc_url( $url ) . '">' . esc_html( $label ) . '</a>';
     }
 
-    private function enqueue_attachment( $attachment_id, $mode, $delay = 30 ) {
-        $attachment_id = absint( $attachment_id );
-        $mode          = sanitize_key( (string) $mode );
+    private function enqueue_attachment( $attachment_id, $mode, $delay = 30, $delete_original = false ) {
+        $attachment_id   = absint( $attachment_id );
+        $mode            = sanitize_key( (string) $mode );
+        $delete_original = (bool) $delete_original && in_array( $mode, array( 'webp', 'both' ), true );
 
         if ( ! $attachment_id || ! in_array( $mode, array( 'compress', 'webp', 'both' ), true ) ) {
             return false;
@@ -1820,16 +1826,20 @@ final class MaoMoMo_TinyPNG_Media {
             $existing_mode = (string) get_post_meta( $attachment_id, self::META_QUEUE_MODE, true );
 
             if ( in_array( $status, array( 'pending', 'running' ), true ) && in_array( $existing_mode, array( 'compress', 'webp', 'both' ), true ) ) {
-                $mode = $this->merge_modes( $existing_mode, $mode );
+                $mode            = $this->merge_modes( $existing_mode, $mode );
+                $delete_original = $delete_original || (bool) get_post_meta( $attachment_id, self::META_QUEUE_DELETE_ORIGINAL, true );
             }
 
-            $now      = time();
-            $go_mode  = $this->is_go_worker_enabled();
+            $now       = time();
+            $go_mode   = $this->is_go_worker_enabled();
             $run_delay = $go_mode ? 1 : max( 1, (int) $delay );
 
             // 运行期间的新请求只合并模式，由当前 Worker 完成后判断是否还需补跑，避免同一附件并发。
             if ( 'running' === $status ) {
                 update_post_meta( $attachment_id, self::META_QUEUE_MODE, $mode );
+                if ( $delete_original ) {
+                    update_post_meta( $attachment_id, self::META_QUEUE_DELETE_ORIGINAL, '1' );
+                }
                 update_post_meta( $attachment_id, self::META_QUEUE_UPDATED_AT, $now );
                 delete_post_meta( $attachment_id, self::META_QUEUE_DONE_AT );
                 $this->schedule_queue_event( MINUTE_IN_SECONDS );
@@ -1841,6 +1851,11 @@ final class MaoMoMo_TinyPNG_Media {
 
             update_post_meta( $attachment_id, self::META_QUEUE_STATUS, 'pending' );
             update_post_meta( $attachment_id, self::META_QUEUE_MODE, $mode );
+            if ( $delete_original ) {
+                update_post_meta( $attachment_id, self::META_QUEUE_DELETE_ORIGINAL, '1' );
+            } else {
+                delete_post_meta( $attachment_id, self::META_QUEUE_DELETE_ORIGINAL );
+            }
             update_post_meta( $attachment_id, self::META_QUEUE_NEXT_RUN, $go_mode ? $now : $now + $run_delay );
             update_post_meta( $attachment_id, self::META_QUEUE_UPDATED_AT, $now );
             delete_post_meta( $attachment_id, self::META_QUEUE_DONE_AT );
@@ -1876,6 +1891,7 @@ final class MaoMoMo_TinyPNG_Media {
         if ( ! in_array( $mode, array( 'compress', 'webp', 'both' ), true ) ) {
             $mode = 'compress';
         }
+        $delete_original = (bool) get_post_meta( $attachment_id, self::META_QUEUE_DELETE_ORIGINAL, true );
 
         $attempts = max( 1, (int) get_post_meta( $attachment_id, self::META_QUEUE_ATTEMPTS, true ) );
         update_post_meta( $attachment_id, self::META_QUEUE_UPDATED_AT, time() );
@@ -1893,7 +1909,7 @@ final class MaoMoMo_TinyPNG_Media {
         $this->queue_processing_attachment_id = $attachment_id;
 
         try {
-            $result = $this->process_attachment( $attachment_id, $mode );
+            $result = $this->process_attachment( $attachment_id, $mode, $delete_original );
         } finally {
             $this->auto_processing = $was_auto_processing;
             $this->queue_processing_attachment_id = $previous_queue_id;
@@ -2406,7 +2422,7 @@ final class MaoMoMo_TinyPNG_Media {
         return (int) $query->found_posts;
     }
 
-    private function process_attachment( $attachment_id, $mode ) {
+    private function process_attachment( $attachment_id, $mode, $delete_original = false ) {
         $summary = $this->empty_summary();
 
         if ( 'running' === (string) get_post_meta( $attachment_id, self::META_QUEUE_STATUS, true )
@@ -2437,7 +2453,7 @@ final class MaoMoMo_TinyPNG_Media {
             }
 
             if ( in_array( $mode, array( 'webp', 'both' ), true ) ) {
-                $result = $this->convert_attachment_to_webp( $attachment_id );
+                $result = $this->convert_attachment_to_webp( $attachment_id, $delete_original );
                 $this->merge_summary( $summary, $result );
             }
 
@@ -2526,7 +2542,7 @@ final class MaoMoMo_TinyPNG_Media {
         return $summary;
     }
 
-    private function convert_attachment_to_webp( $attachment_id ) {
+    private function convert_attachment_to_webp( $attachment_id, $delete_original = false ) {
         $summary = $this->empty_summary();
         $source  = get_attached_file( $attachment_id );
 
@@ -2537,6 +2553,9 @@ final class MaoMoMo_TinyPNG_Media {
         }
 
         if ( 'webp' === strtolower( pathinfo( $source, PATHINFO_EXTENSION ) ) ) {
+            if ( $delete_original ) {
+                delete_post_meta( $attachment_id, self::META_QUEUE_DELETE_ORIGINAL );
+            }
             $summary['skipped']++;
             $summary['messages'][] = '附件 #' . $attachment_id . ' 已经是 WebP。';
             return $summary;
@@ -2552,7 +2571,7 @@ final class MaoMoMo_TinyPNG_Media {
             return $summary;
         }
 
-        $webp_path = $this->get_or_create_webp_path( $attachment_id, $source );
+        $webp_path = $this->get_or_create_webp_path( $attachment_id, $source, ! $delete_original );
         if ( is_wp_error( $webp_path ) ) {
             $summary['failed']++;
             $summary['messages'][] = $webp_path->get_error_message();
@@ -2567,8 +2586,18 @@ final class MaoMoMo_TinyPNG_Media {
         }
 
         clearstatcache( true, $webp_path );
-        $after   = filesize( $webp_path );
-        $webp_id = $this->upsert_webp_attachment( $attachment_id, $webp_path );
+        $after = filesize( $webp_path );
+        if ( $delete_original ) {
+            $replacement = $this->replace_original_attachment_with_webp( $attachment_id, $webp_path );
+            $webp_id     = is_array( $replacement ) && isset( $replacement['attachment_id'] )
+                ? (int) $replacement['attachment_id']
+                : $replacement;
+            if ( is_array( $replacement ) && ! empty( $replacement['messages'] ) ) {
+                $summary['messages'] = array_merge( $summary['messages'], $replacement['messages'] );
+            }
+        } else {
+            $webp_id = $this->upsert_webp_attachment( $attachment_id, $webp_path );
+        }
 
         if ( is_wp_error( $webp_id ) ) {
             $summary['failed']++;
@@ -2825,18 +2854,20 @@ final class MaoMoMo_TinyPNG_Media {
         wp_update_attachment_metadata( $attachment_id, $metadata );
     }
 
-    private function get_or_create_webp_path( $attachment_id, $source ) {
-        $existing_id = (int) get_post_meta( $attachment_id, '_maomomo_tinypng_webp_id', true );
-        if ( $existing_id && 'attachment' === get_post_type( $existing_id ) ) {
-            $existing_file = get_attached_file( $existing_id );
-            if ( $existing_file && file_exists( $existing_file ) ) {
-                return $existing_file;
-            }
+    private function get_or_create_webp_path( $attachment_id, $source, $reuse_existing = true ) {
+        if ( $reuse_existing ) {
+            $existing_id = (int) get_post_meta( $attachment_id, '_maomomo_tinypng_webp_id', true );
+            if ( $existing_id && 'attachment' === get_post_type( $existing_id ) ) {
+                $existing_file = get_attached_file( $existing_id );
+                if ( $existing_file && file_exists( $existing_file ) ) {
+                    return $existing_file;
+                }
 
-            $repaired_file = $this->guess_existing_webp_file( $existing_id, $source );
-            if ( $repaired_file ) {
-                update_post_meta( $existing_id, '_wp_attached_file', $this->attachment_relative_path( $repaired_file ) );
-                return $repaired_file;
+                $repaired_file = $this->guess_existing_webp_file( $existing_id, $source );
+                if ( $repaired_file ) {
+                    update_post_meta( $existing_id, '_wp_attached_file', $this->attachment_relative_path( $repaired_file ) );
+                    return $repaired_file;
+                }
             }
         }
 
@@ -2845,6 +2876,129 @@ final class MaoMoMo_TinyPNG_Media {
         $filename  = wp_unique_filename( $dir, $base_name );
 
         return $dir . DIRECTORY_SEPARATOR . $filename;
+    }
+
+    private function replace_original_attachment_with_webp( $attachment_id, $webp_path ) {
+        $attachment_id = absint( $attachment_id );
+        $webp_path     = wp_normalize_path( (string) $webp_path );
+        $source_path   = wp_normalize_path( (string) get_attached_file( $attachment_id, true ) );
+
+        if ( ! $attachment_id || ! file_exists( $webp_path ) || 'webp' !== strtolower( pathinfo( $webp_path, PATHINFO_EXTENSION ) ) ) {
+            return new WP_Error( 'maomomo_tinypng_webp_replace_missing', '用于替换原附件的 WebP 文件无效。' );
+        }
+        if ( ! $this->is_path_in_uploads( $webp_path ) ) {
+            return new WP_Error( 'maomomo_tinypng_webp_replace_path', 'WebP 文件不在 uploads 目录中。' );
+        }
+        if ( '' === $source_path || ! file_exists( $source_path ) ) {
+            return new WP_Error( 'maomomo_tinypng_webp_replace_source', '替换前找不到原附件文件。' );
+        }
+        if ( $source_path === $webp_path ) {
+            delete_post_meta( $attachment_id, self::META_QUEUE_DELETE_ORIGINAL );
+            return array(
+                'attachment_id' => $attachment_id,
+                'messages'      => array(),
+            );
+        }
+
+        $old_metadata = wp_get_attachment_metadata( $attachment_id );
+        $old_paths    = $this->attachment_paths_from_metadata( $source_path, $old_metadata );
+        $old_relative = (string) get_post_meta( $attachment_id, '_wp_attached_file', true );
+        $old_mime     = (string) get_post_mime_type( $attachment_id );
+
+        require_once ABSPATH . 'wp-admin/includes/image.php';
+
+        $was_auto_processing   = $this->auto_processing;
+        $this->auto_processing = true;
+        try {
+            $new_metadata = wp_generate_attachment_metadata( $attachment_id, $webp_path );
+        } finally {
+            $this->auto_processing = $was_auto_processing;
+        }
+        if ( ! is_array( $new_metadata ) || empty( $new_metadata ) ) {
+            $new_metadata = $this->build_basic_image_metadata( $webp_path );
+        }
+        $new_metadata['file']     = $this->attachment_relative_path( $webp_path );
+        $new_metadata['filesize'] = filesize( $webp_path );
+
+        $updated_post = wp_update_post(
+            array(
+                'ID'             => $attachment_id,
+                'post_mime_type' => 'image/webp',
+            ),
+            true
+        );
+        if ( is_wp_error( $updated_post ) ) {
+            $this->delete_generated_webp_paths( $webp_path, $new_metadata );
+            return $updated_post;
+        }
+
+        if ( false === update_post_meta( $attachment_id, '_wp_attached_file', $new_metadata['file'] ) ) {
+            wp_update_post( array( 'ID' => $attachment_id, 'post_mime_type' => $old_mime ) );
+            $this->delete_generated_webp_paths( $webp_path, $new_metadata );
+            return new WP_Error( 'maomomo_tinypng_webp_replace_file_meta', '无法把原附件路径更新为 WebP。' );
+        }
+        if ( false === wp_update_attachment_metadata( $attachment_id, $new_metadata ) ) {
+            update_post_meta( $attachment_id, '_wp_attached_file', $old_relative );
+            wp_update_post( array( 'ID' => $attachment_id, 'post_mime_type' => $old_mime ) );
+            $this->delete_generated_webp_paths( $webp_path, $new_metadata );
+            return new WP_Error( 'maomomo_tinypng_webp_replace_metadata', '无法写回 WebP 附件元数据。' );
+        }
+
+        delete_post_meta( $attachment_id, '_maomomo_tinypng_webp_id' );
+        delete_post_meta( $attachment_id, self::META_QUEUE_DELETE_ORIGINAL );
+
+        $new_paths = $this->attachment_paths_from_metadata( $webp_path, $new_metadata );
+        $keep      = array_fill_keys( array_map( 'wp_normalize_path', $new_paths ), true );
+        $failed    = array();
+        foreach ( array_unique( $old_paths ) as $old_path ) {
+            $old_path = wp_normalize_path( $old_path );
+            if ( isset( $keep[ $old_path ] ) || ! file_exists( $old_path ) || ! $this->is_path_in_uploads( $old_path ) ) {
+                continue;
+            }
+            wp_delete_file( $old_path );
+            clearstatcache( true, $old_path );
+            if ( file_exists( $old_path ) ) {
+                $failed[] = wp_basename( $old_path );
+            }
+        }
+
+        return array(
+            'attachment_id' => $attachment_id,
+            'messages'      => empty( $failed )
+                ? array( '已将原附件替换为 WebP，并删除旧原图和旧缩略图。' )
+                : array( '附件已替换为 WebP，但以下旧文件删除失败：' . implode( '、', $failed ) ),
+        );
+    }
+
+    private function attachment_paths_from_metadata( $main_path, $metadata ) {
+        $main_path = wp_normalize_path( (string) $main_path );
+        $base_dir  = dirname( $main_path );
+        $paths     = array( $main_path );
+
+        if ( ! is_array( $metadata ) ) {
+            return $paths;
+        }
+        if ( ! empty( $metadata['sizes'] ) && is_array( $metadata['sizes'] ) ) {
+            foreach ( $metadata['sizes'] as $size ) {
+                if ( ! empty( $size['file'] ) ) {
+                    $paths[] = wp_normalize_path( $base_dir . DIRECTORY_SEPARATOR . $size['file'] );
+                }
+            }
+        }
+        if ( ! empty( $metadata['original_image'] ) ) {
+            $paths[] = wp_normalize_path( $base_dir . DIRECTORY_SEPARATOR . $metadata['original_image'] );
+        }
+
+        return array_values( array_unique( $paths ) );
+    }
+
+    private function delete_generated_webp_paths( $main_path, $metadata ) {
+        foreach ( $this->attachment_paths_from_metadata( $main_path, $metadata ) as $path ) {
+            $path = wp_normalize_path( $path );
+            if ( file_exists( $path ) && $this->is_path_in_uploads( $path ) ) {
+                wp_delete_file( $path );
+            }
+        }
     }
 
     private function upsert_webp_attachment( $source_id, $webp_path ) {
@@ -3221,9 +3375,10 @@ final class MaoMoMo_TinyPNG_Media {
             );
         }
 
-        $source_path    = '';
-        $webp_path      = '';
-        $compress_paths = array();
+        $source_path     = '';
+        $webp_path       = '';
+        $compress_paths  = array();
+        $delete_original = (bool) get_post_meta( $attachment_id, self::META_QUEUE_DELETE_ORIGINAL, true );
         if ( in_array( $mode, array( 'compress', 'both' ), true ) ) {
             $compress_paths = array_values( array_map( 'wp_normalize_path', $this->get_attachment_image_paths( $attachment_id ) ) );
         }
@@ -3234,7 +3389,7 @@ final class MaoMoMo_TinyPNG_Media {
             }
             $source_path = wp_normalize_path( $source_path );
             if ( 'webp' !== strtolower( pathinfo( $source_path, PATHINFO_EXTENSION ) ) ) {
-                $webp_path = $this->get_or_create_webp_path( $attachment_id, $source_path );
+                $webp_path = $this->get_or_create_webp_path( $attachment_id, $source_path, ! $delete_original );
                 if ( is_wp_error( $webp_path ) ) {
                     return $webp_path;
                 }
@@ -3319,17 +3474,33 @@ final class MaoMoMo_TinyPNG_Media {
         if ( in_array( $mode, array( 'compress', 'both' ), true ) ) {
             $this->refresh_attachment_filesizes( $attachment_id );
         }
+        $delete_original = (bool) get_post_meta( $attachment_id, self::META_QUEUE_DELETE_ORIGINAL, true );
         if ( ! empty( $result['webp_path'] ) && $summary['webp'] > 0 ) {
             $webp_path = wp_normalize_path( (string) $result['webp_path'] );
             if ( ! $this->is_path_in_uploads( $webp_path ) ) {
                 $summary['failed']++;
                 $summary['messages'][] = 'Go Worker 返回的 WebP 路径不在 uploads 目录。';
             } else {
-                $webp_id = $this->upsert_webp_attachment( $attachment_id, $webp_path );
+                if ( $delete_original ) {
+                    $replacement = $this->replace_original_attachment_with_webp( $attachment_id, $webp_path );
+                    $webp_id     = is_array( $replacement ) && isset( $replacement['attachment_id'] )
+                        ? (int) $replacement['attachment_id']
+                        : $replacement;
+                    if ( is_array( $replacement ) && ! empty( $replacement['messages'] ) ) {
+                        $summary['messages'] = array_merge( $summary['messages'], $replacement['messages'] );
+                    }
+                } else {
+                    $webp_id = $this->upsert_webp_attachment( $attachment_id, $webp_path );
+                }
                 if ( is_wp_error( $webp_id ) ) {
                     $summary['failed']++;
                     $summary['messages'][] = $webp_id->get_error_message();
                 }
+            }
+        } elseif ( $delete_original && 0 === $summary['failed'] ) {
+            $attached_file = get_attached_file( $attachment_id );
+            if ( $attached_file && 'webp' === strtolower( pathinfo( $attached_file, PATHINFO_EXTENSION ) ) ) {
+                delete_post_meta( $attachment_id, self::META_QUEUE_DELETE_ORIGINAL );
             }
         }
 

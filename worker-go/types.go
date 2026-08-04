@@ -2,7 +2,7 @@ package main
 
 import "time"
 
-const workerVersion = "1.7.2"
+const workerVersion = "1.7.3"
 
 type tokenConfig struct {
 	ID           string `json:"id"`

@@ -2,6 +2,8 @@
 
 Go 常驻服务负责附件级 3 Worker 并发、TinyPNG API 请求、流式文件下载和原子替换。WordPress 插件负责创建任务、Token 配置、附件 metadata 与 WebP 附件记录。
 
+选择「自动转 WebP 并删除原文件」时，Go 仍只负责生成 WebP；WordPress 确认结果、更新原附件路径与 metadata 后，才会删除旧原图和旧缩略图。转换或数据库写回失败不会删除原文件。
+
 ## 环境变量
 
 | 变量 | 默认值 | 说明 |
