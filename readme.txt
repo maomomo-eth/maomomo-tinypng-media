@@ -2,7 +2,7 @@
 Contributors: maomomo
 Requires at least: 5.8
 Requires PHP: 7.4
-Stable tag: 1.7.3
+Stable tag: 1.7.4
 
 在 WordPress 媒体库中使用多个 TinyPNG API Token 轮换压缩图片，并支持转换 WebP。
 
@@ -150,6 +150,12 @@ TOKEN_2
 从 1.5.0 开始，插件支持在 WordPress 后台检查并安装 GitHub 正式 Release。1.4.0 及更早版本尚未包含更新检查器，需要先手动安装一次 1.5.0 或更高版本。
 
 == 更新日志 ==
+
+= 1.7.4 =
+
+* 修复部分站点在转 WebP 并删除原文件时误报“无法写回 WebP 附件元数据”。
+* metadata 写入改为数据库回读核验，兼容第三方过滤器、对象缓存和未变更返回值。
+* WebP 切换失败时完整恢复原附件路径、MIME 和原 metadata。
 
 = 1.7.3 =
 

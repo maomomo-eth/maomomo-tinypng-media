@@ -3,7 +3,7 @@
  * Plugin Name: MaoMoMo TinyPNG Media
  * Plugin URI: https://www.maomomo.com
  * Description: 在媒体库中使用多个 TinyPNG API Token 轮换压缩图片，并支持转换 WebP。
- * Version: 1.7.3
+ * Version: 1.7.4
  * Author: MAOMOMO
  * Author URI: https://www.maomomo.com
  * Requires at least: 5.8
@@ -2932,14 +2932,13 @@ final class MaoMoMo_TinyPNG_Media {
             return $updated_post;
         }
 
-        if ( false === update_post_meta( $attachment_id, '_wp_attached_file', $new_metadata['file'] ) ) {
-            wp_update_post( array( 'ID' => $attachment_id, 'post_mime_type' => $old_mime ) );
+        if ( ! $this->update_attached_file_meta_verified( $attachment_id, $new_metadata['file'] ) ) {
+            $this->restore_original_attachment_state( $attachment_id, $old_relative, $old_metadata, $old_mime );
             $this->delete_generated_webp_paths( $webp_path, $new_metadata );
             return new WP_Error( 'maomomo_tinypng_webp_replace_file_meta', '无法把原附件路径更新为 WebP。' );
         }
-        if ( false === wp_update_attachment_metadata( $attachment_id, $new_metadata ) ) {
-            update_post_meta( $attachment_id, '_wp_attached_file', $old_relative );
-            wp_update_post( array( 'ID' => $attachment_id, 'post_mime_type' => $old_mime ) );
+        if ( ! $this->update_attachment_metadata_verified( $attachment_id, $new_metadata ) ) {
+            $this->restore_original_attachment_state( $attachment_id, $old_relative, $old_metadata, $old_mime );
             $this->delete_generated_webp_paths( $webp_path, $new_metadata );
             return new WP_Error( 'maomomo_tinypng_webp_replace_metadata', '无法写回 WebP 附件元数据。' );
         }
@@ -2990,6 +2989,59 @@ final class MaoMoMo_TinyPNG_Media {
         }
 
         return array_values( array_unique( $paths ) );
+    }
+
+    private function update_attached_file_meta_verified( $attachment_id, $relative_path ) {
+        $relative_path = wp_normalize_path( (string) $relative_path );
+        update_post_meta( $attachment_id, '_wp_attached_file', $relative_path );
+        wp_cache_delete( $attachment_id, 'post_meta' );
+
+        $stored = wp_normalize_path( (string) get_post_meta( $attachment_id, '_wp_attached_file', true ) );
+        return '' !== $relative_path && hash_equals( $relative_path, $stored );
+    }
+
+    private function update_attachment_metadata_verified( $attachment_id, $metadata ) {
+        wp_update_attachment_metadata( $attachment_id, $metadata );
+        wp_cache_delete( $attachment_id, 'post_meta' );
+
+        $stored = wp_get_attachment_metadata( $attachment_id );
+        if ( $this->attachment_metadata_matches( $stored, $metadata ) ) {
+            return true;
+        }
+
+        // 第三方过滤器可能令 wp_update_attachment_metadata() 返回 false 或删除 metadata；
+        // 此处写入已经生成并校验过的 WebP metadata，再从数据库重新读取确认。
+        update_post_meta( $attachment_id, '_wp_attachment_metadata', $metadata );
+        wp_cache_delete( $attachment_id, 'post_meta' );
+
+        return $this->attachment_metadata_matches( wp_get_attachment_metadata( $attachment_id ), $metadata );
+    }
+
+    private function attachment_metadata_matches( $stored, $expected ) {
+        if ( ! is_array( $stored ) || ! is_array( $expected ) || empty( $stored['file'] ) || empty( $expected['file'] ) ) {
+            return false;
+        }
+
+        return hash_equals(
+            wp_normalize_path( (string) $expected['file'] ),
+            wp_normalize_path( (string) $stored['file'] )
+        );
+    }
+
+    private function restore_original_attachment_state( $attachment_id, $relative_path, $metadata, $mime ) {
+        update_post_meta( $attachment_id, '_wp_attached_file', (string) $relative_path );
+        if ( is_array( $metadata ) && ! empty( $metadata ) ) {
+            update_post_meta( $attachment_id, '_wp_attachment_metadata', $metadata );
+        } else {
+            delete_post_meta( $attachment_id, '_wp_attachment_metadata' );
+        }
+        wp_update_post(
+            array(
+                'ID'             => $attachment_id,
+                'post_mime_type' => (string) $mime,
+            )
+        );
+        wp_cache_delete( $attachment_id, 'post_meta' );
     }
 
     private function delete_generated_webp_paths( $main_path, $metadata ) {
